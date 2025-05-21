@@ -766,7 +766,7 @@ void Population::update_military(color_ostream & out)
                     ai.plan.freesoldierbarrack(out, u->id);
                 }
                 std::vector<Units::NoblePosition> positions;
-                if (!Units::isChild(u) && !Units::isBaby(u) && u->mood == mood_type::None && !Units::getNoblePositions(&positions, u) &&
+                if (Units::isSane(u) && !Units::isChild(u) && !Units::isBaby(u) && u->mood == mood_type::None && !Units::getNoblePositions(&positions, u) &&
                     !u->status.labors[unit_labor::MINE] && !u->status.labors[unit_labor::CUTWOOD] && !u->status.labors[unit_labor::HUNT])
                 {
                     draft_pool.push_back(u);

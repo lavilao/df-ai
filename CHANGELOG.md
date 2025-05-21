@@ -1,3 +1,9 @@
+# 0.47.05-r8 Compatibility Update
+
+- Updated for compatibility with DFHack version 0.47.05-r8.
+  - Modified `population_military.cpp`: Added `Units::isSane(u)` to the condition for adding units to the `draft_pool` within the `Population::update_military` function. This change ensures that only sane citizens are considered for the draft pool, addressing potential behavioral changes in the `Units::isCitizen()` predicate in DFHack 0.47.05-r8 and maintaining the likely original intent of the AI's drafting logic.
+- **Note:** Full compilation and in-game testing of this df-ai version with DFHack 0.47.05-r8 could not be completed due to limitations in the available build environment (missing DFHack 0.47.05-r8 SDK). The applied code change is based on API changelog analysis.
+
 # Future
 
 - Added announcements to the lockstep movie recording log.
