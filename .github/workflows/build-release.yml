@@ -4,13 +4,13 @@ on:
   push:
     branches:
       - main
-  workflow_dispatch: {}
+  workflow_dispatch:
 
 jobs:
   build-release:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write # Required to create a release
+    permissions: # This is line 9 (index 8)
+      contents: write # Required to create a release # This is line 10 (index 9)
 
     steps:
       - name: Checkout df-ai source
