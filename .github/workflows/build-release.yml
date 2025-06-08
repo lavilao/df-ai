@@ -32,7 +32,7 @@ jobs:
           echo "::group::Cloning DFHack 0.47.05-r8"
           git clone --depth 1 --branch 0.47.05-r8 https://github.com/DFHack/dfhack.git dfhack-src
           echo "::endgroup::"
-          
+
           echo "::group::Initializing DFHack submodules"
           cd dfhack-src
           git submodule update --init --recursive
@@ -45,12 +45,12 @@ jobs:
           mkdir -p dfhack-src/plugins/df-ai
           rsync -av --delete --exclude='.git' df-ai-src/ dfhack-src/plugins/df-ai/
           echo "::endgroup::"
-          
+
           echo "::group::Updating DFHack custom CMake file"
           echo 'add_subdirectory(df-ai)' >> dfhack-src/plugins/CMakeLists.custom.txt
           echo "::notice::Added df-ai to dfhack-src/plugins/CMakeLists.custom.txt"
           echo "::endgroup::"
-        
+
     - name: Build DFHack and df-ai plugin
       run: |
         echo "::group::Building DFHack (which includes df-ai plugin)"
@@ -67,12 +67,12 @@ jobs:
         PLUGIN_SUFFIX=".plug.so" # Assuming Linux output name
         PLUGIN_FILENAME="${PLUGIN_BASENAME}${PLUGIN_SUFFIX}"
         EXPECTED_PLUGIN_PATH="$GITHUB_WORKSPACE/dfhack-src/build/plugins/${PLUGIN_BASENAME}/${PLUGIN_FILENAME}"
-        
+
         ARTIFACT_NAME="df-ai-0.47.05-r8-build" # Using a more static artifact name for the tarball itself
-        
+
         echo "::group::Preparing package directory"
         mkdir -p release_package/df-ai-blueprints
-        
+
         echo "::notice::Looking for plugin at $EXPECTED_PLUGIN_PATH"
         if [ -f "$EXPECTED_PLUGIN_PATH" ]; then
           cp "$EXPECTED_PLUGIN_PATH" "release_package/"
@@ -81,7 +81,7 @@ jobs:
           echo "::error::Built plugin $PLUGIN_FILENAME not found at $EXPECTED_PLUGIN_PATH. Creating a dummy file for packaging demonstration."
           touch "release_package/$PLUGIN_FILENAME" # Dummy file
         fi
-        
+
         # Copy blueprint assets from the df-ai source now integrated into dfhack-src
         BLUEPRINT_SRC_BASE="$GITHUB_WORKSPACE/dfhack-src/plugins/df-ai"
         if [ -d "${BLUEPRINT_SRC_BASE}/rooms" ]; then
@@ -113,12 +113,12 @@ jobs:
         RELEASE_TAG="v0.47.05-r8-${{ steps.datetime.outputs.datetime }}"
         ARTIFACT_PATH_LOCAL="${{ env.ARTIFACT_PATH }}" # e.g., df-ai-0.47.05-r8-build.tar.gz
         ARTIFACT_UPLOAD_AS_NAME="${{ env.ARTIFACT_UPLOAD_NAME }}" # e.g., df-ai-0.47.05-r8-build-YYYYMMDDHHMMSS.tar.gz
-        
+
         if [ ! -f "$ARTIFACT_PATH_LOCAL" ]; then
           echo "::error::Artifact $ARTIFACT_PATH_LOCAL not found!"
           exit 1
         fi
-        
+
         echo "::notice::Creating release $RELEASE_TAG and uploading $ARTIFACT_PATH_LOCAL as $ARTIFACT_UPLOAD_AS_NAME"
         gh release create "$RELEASE_TAG" \
             --title "df-ai for DFHack 0.47.05-r8 (Build ${{ steps.datetime.outputs.datetime }})" \
