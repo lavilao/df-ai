@@ -13,136 +13,115 @@ jobs:
       contents: write # Required to create a release
 
     steps:
-      - name: Checkout repository
+      - name: Checkout df-ai source
         uses: actions/checkout@v4
+        with:
+          path: df-ai-src # Checkout df-ai to a specific subdirectory
 
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake libboost-all-dev wget tar gzip
+          sudo apt-get install -y cmake libboost-all-dev git wget tar gzip build-essential rsync
 
-      - name: Download and Build DFHack 0.47.05-r8 SDK
+      - name: Get current date and time
+        id: datetime
+        run: echo "datetime=$(date --utc +'%Y%m%d%H%M%S')" >> $GITHUB_OUTPUT
+
+      - name: Clone DFHack and Initialize Submodules
         run: |
-          echo "::group::Downloading DFHack 0.47.05-r8"
-          wget https://github.com/DFHack/dfhack/archive/refs/tags/0.47.05-r8.tar.gz -O dfhack-0.47.05-r8.tar.gz
+          echo "::group::Cloning DFHack 0.47.05-r8"
+          git clone --depth 1 --branch 0.47.05-r8 https://github.com/DFHack/dfhack.git dfhack-src
           echo "::endgroup::"
 
-          echo "::group::Extracting DFHack source"
-          mkdir dfhack-src # This creates dfhack-src at $GITHUB_WORKSPACE/dfhack-src
-          tar -xzf dfhack-0.47.05-r8.tar.gz -C dfhack-src --strip-components=1
+          echo "::group::Initializing DFHack submodules"
+          cd dfhack-src
+          git submodule update --init --recursive
+          cd $GITHUB_WORKSPACE
           echo "::endgroup::"
 
-          echo "::group::Building DFHack (SDK components)"
-          cd dfhack-src # Current directory: $GITHUB_WORKSPACE/dfhack-src
-          mkdir -p build # Changed to -p. This creates $GITHUB_WORKSPACE/dfhack-src/build
-          cd build # Current directory: $GITHUB_WORKSPACE/dfhack-src/build
-          # Configure DFHack. We mainly need the CMake files and potentially some generated headers/libs.
-          # Depending on DFHack's CMake setup for this version,
-          # we might not need to build all of DFHack, but building it is a safe bet
-          # to ensure all SDK components are generated.
-          cmake ..
-          make -j$(nproc) dfhack-run # Attempt to build a minimal target that generates SDK files, or just 'make'
-          # Alternatively, a more targeted 'make install' might place SDK files in a predictable location
-          # if DFHack's CMake supports it for SDK purposes.
-          # For now, we assume DFHackToolchain.cmake is generated in dfhack-src/build/
-          echo "::endgroup::"
-          cd $GITHUB_WORKSPACE # Ensure we are back in the root for the next steps ($GITHUB_WORKSPACE)
-
-      - name: Build df-ai Plugin
+      - name: Integrate df-ai into DFHack plugins
         run: |
-          mkdir -p build # Changed to -p for consistency. This creates $GITHUB_WORKSPACE/build for df-ai
-          cd build # Current directory: $GITHUB_WORKSPACE/build
-          echo "::notice::Attempting to configure df-ai with locally built DFHack SDK."
-          echo "::notice::Using toolchain file: $GITHUB_WORKSPACE/dfhack-src/build/DFHackToolchain.cmake"
-          # Adjust CMAKE_TOOLCHAIN_FILE path if DFHackToolchain.cmake is located elsewhere in the DFHack build dir
-          cmake -DCMAKE_TOOLCHAIN_FILE=$GITHUB_WORKSPACE/dfhack-src/build/DFHackToolchain.cmake ..
-          make -j$(nproc)
-
-      - name: Package Plugin
-        run: |
-          PLUGIN_NAME="df-ai.plug.so" # Assuming Linux output name
-          ARTIFACT_NAME="df-ai-plugin-0.47.05-r8-${{ github.run_id }}"
-
-          echo "::group::Preparing package directory"
-          # release_package will be at $GITHUB_WORKSPACE/build/release_package
-          mkdir -p release_package/df-ai-blueprints
-          # Copy the plugin binary
-          # The exact path might depend on how DFHACK_PLUGIN macro in CMakeLists.txt outputs files.
-          # Common paths are 'build/plugins/', 'build/df-ai.plug.so', or just 'build/'
-          PLUGIN_BINARY_PATH=""
-          # Corrected paths to search within the df-ai build directory ($GITHUB_WORKSPACE/build)
-          if [ -f "$GITHUB_WORKSPACE/build/plugins/$PLUGIN_NAME" ]; then
-            PLUGIN_BINARY_PATH="$GITHUB_WORKSPACE/build/plugins/$PLUGIN_NAME"
-          elif [ -f "$GITHUB_WORKSPACE/build/$PLUGIN_NAME" ]; then
-            PLUGIN_BINARY_PATH="$GITHUB_WORKSPACE/build/$PLUGIN_NAME"
-          else
-            echo "::warning::Built plugin $PLUGIN_NAME not found in common locations ($GITHUB_WORKSPACE/build/ or $GITHUB_WORKSPACE/build/plugins/). Will try to find it."
-            # Try to find it anywhere in the df-ai build directory
-            FOUND_PLUGIN=$(find "$GITHUB_WORKSPACE/build" -name $PLUGIN_NAME -print -quit)
-            if [ -n "$FOUND_PLUGIN" ]; then
-                PLUGIN_BINARY_PATH="$FOUND_PLUGIN"
-                echo "::notice::Found plugin at $PLUGIN_BINARY_PATH"
-            else
-                echo "::error::Built plugin $PLUGIN_NAME could not be found. Creating a dummy file for packaging demonstration."
-                touch "$GITHUB_WORKSPACE/build/release_package/$PLUGIN_NAME" # Dummy file
-            fi
-          fi
-
-          if [ -n "$PLUGIN_BINARY_PATH" ]; then
-            cp "$PLUGIN_BINARY_PATH" "$GITHUB_WORKSPACE/build/release_package/"
-          fi
-
-          # Copy blueprint assets
-          # These paths depend on how INSTALL targets in CMakeLists.txt are configured for df-ai.
-          # If they are installed to '$GITHUB_WORKSPACE/build/df-ai-blueprints', this is correct.
-          if [ -d "$GITHUB_WORKSPACE/build/df-ai-blueprints/rooms" ]; then
-            cp -r "$GITHUB_WORKSPACE/build/df-ai-blueprints/rooms" "$GITHUB_WORKSPACE/build/release_package/df-ai-blueprints/"
-          else
-            echo "::warning::'$GITHUB_WORKSPACE/build/df-ai-blueprints/rooms' not found. Assuming blueprints are in repo root."
-            # Fallback if blueprints are in the root of the repo
-            if [ -d "$GITHUB_WORKSPACE/rooms" ]; then
-                cp -r "$GITHUB_WORKSPACE/rooms" "$GITHUB_WORKSPACE/build/release_package/df-ai-blueprints/"
-            else
-                echo "::error::Blueprint 'rooms' directory not found in df-ai build output or repository root."
-            fi
-          fi
-          if [ -d "$GITHUB_WORKSPACE/build/df-ai-blueprints/plans" ]; then
-            cp -r "$GITHUB_WORKSPACE/build/df-ai-blueprints/plans" "$GITHUB_WORKSPACE/build/release_package/df-ai-blueprints/"
-          else
-            echo "::warning::'$GITHUB_WORKSPACE/build/df-ai-blueprints/plans' not found. Assuming blueprints are in repo root."
-            if [ -d "$GITHUB_WORKSPACE/plans" ]; then
-                cp -r "$GITHUB_WORKSPACE/plans" "$GITHUB_WORKSPACE/build/release_package/df-ai-blueprints/"
-            else
-                echo "::error::Blueprint 'plans' directory not found in df-ai build output or repository root."
-            fi
-          fi
+          echo "::group::Moving df-ai source into DFHack plugins directory"
+          mkdir -p dfhack-src/plugins/df-ai
+          rsync -av --delete --exclude='.git' df-ai-src/ dfhack-src/plugins/df-ai/
           echo "::endgroup::"
 
-          echo "::group::Creating archive"
-          # Archive created from contents of $GITHUB_WORKSPACE/build/release_package
-          tar -czvf "$GITHUB_WORKSPACE/build/${ARTIFACT_NAME}.tar.gz" -C "$GITHUB_WORKSPACE/build/release_package" .
+          echo "::group::Updating DFHack custom CMake file"
+          echo 'add_subdirectory(df-ai)' >> dfhack-src/plugins/CMakeLists.custom.txt
+          echo "::notice::Added df-ai to dfhack-src/plugins/CMakeLists.custom.txt"
           echo "::endgroup::"
-          # Set ARTIFACT_PATH to be relative to $GITHUB_WORKSPACE for the next step
-          echo "ARTIFACT_PATH=build/${ARTIFACT_NAME}.tar.gz" >> $GITHUB_ENV
+
+    - name: Build DFHack and df-ai plugin
+      run: |
+        echo "::group::Building DFHack (which includes df-ai plugin)"
+        mkdir -p dfhack-src/build
+        cd dfhack-src/build
+        cmake ..
+        make -j$(nproc) df-ai # Assuming 'df-ai' is the correct make target for the plugin
+        echo "::endgroup::"
+        cd $GITHUB_WORKSPACE
+
+    - name: Package Plugin
+      run: |
+        PLUGIN_BASENAME="df-ai" # Base name for the plugin
+        PLUGIN_SUFFIX=".plug.so" # Assuming Linux output name
+        PLUGIN_FILENAME="${PLUGIN_BASENAME}${PLUGIN_SUFFIX}"
+        EXPECTED_PLUGIN_PATH="$GITHUB_WORKSPACE/dfhack-src/build/plugins/${PLUGIN_BASENAME}/${PLUGIN_FILENAME}"
+
+        ARTIFACT_NAME="df-ai-0.47.05-r8-build" # Using a more static artifact name for the tarball itself
+
+        echo "::group::Preparing package directory"
+        mkdir -p release_package/df-ai-blueprints
+
+        echo "::notice::Looking for plugin at $EXPECTED_PLUGIN_PATH"
+        if [ -f "$EXPECTED_PLUGIN_PATH" ]; then
+          cp "$EXPECTED_PLUGIN_PATH" "release_package/"
+          echo "::notice::Copied $PLUGIN_FILENAME to release_package/"
+        else
+          echo "::error::Built plugin $PLUGIN_FILENAME not found at $EXPECTED_PLUGIN_PATH. Creating a dummy file for packaging demonstration."
+          touch "release_package/$PLUGIN_FILENAME" # Dummy file
+        fi
+
+        # Copy blueprint assets from the df-ai source now integrated into dfhack-src
+        BLUEPRINT_SRC_BASE="$GITHUB_WORKSPACE/dfhack-src/plugins/df-ai"
+        if [ -d "${BLUEPRINT_SRC_BASE}/rooms" ]; then
+          cp -r "${BLUEPRINT_SRC_BASE}/rooms" "release_package/df-ai-blueprints/"
+          echo "::notice::Copied rooms blueprints."
+        else
+          echo "::warning::Blueprint 'rooms' directory not found at ${BLUEPRINT_SRC_BASE}/rooms."
+        fi
+        if [ -d "${BLUEPRINT_SRC_BASE}/plans" ]; then
+          cp -r "${BLUEPRINT_SRC_BASE}/plans" "release_package/df-ai-blueprints/"
+          echo "::notice::Copied plans blueprints."
+        else
+          echo "::warning::Blueprint 'plans' directory not found at ${BLUEPRINT_SRC_BASE}/plans."
+        fi
+        echo "::endgroup::"
+
+        echo "::group::Creating archive"
+        tar -czvf "${ARTIFACT_NAME}.tar.gz" -C release_package .
+        echo "::endgroup::"
+        echo "ARTIFACT_PATH=${ARTIFACT_NAME}.tar.gz" >> $GITHUB_ENV
+        echo "ARTIFACT_UPLOAD_NAME=${ARTIFACT_NAME}-${{ steps.datetime.outputs.datetime }}.tar.gz" >> $GITHUB_ENV
 
 
-      - name: Create Release and Upload Asset
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          RELEASE_TAG="v0.47.05-r8-build-${{ github.run_id }}"
-          # ARTIFACT_PATH is now relative to GITHUB_WORKSPACE
-          ARTIFACT_PATH_FULL="$GITHUB_WORKSPACE/${{ env.ARTIFACT_PATH }}"
+    - name: Create Release and Upload Asset
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GH_REPO: ${{ github.repository }}
+      run: |
+        RELEASE_TAG="v0.47.05-r8-${{ steps.datetime.outputs.datetime }}"
+        ARTIFACT_PATH_LOCAL="${{ env.ARTIFACT_PATH }}" # e.g., df-ai-0.47.05-r8-build.tar.gz
+        ARTIFACT_UPLOAD_AS_NAME="${{ env.ARTIFACT_UPLOAD_NAME }}" # e.g., df-ai-0.47.05-r8-build-YYYYMMDDHHMMSS.tar.gz
 
-          if [ ! -f "$ARTIFACT_PATH_FULL" ]; then
-            echo "::error::Artifact $ARTIFACT_PATH_FULL not found!"
-            exit 1
-          fi
+        if [ ! -f "$ARTIFACT_PATH_LOCAL" ]; then
+          echo "::error::Artifact $ARTIFACT_PATH_LOCAL not found!"
+          exit 1
+        fi
 
-          echo "::notice::Creating release $RELEASE_TAG and uploading $ARTIFACT_PATH_FULL"
-          gh release create "$RELEASE_TAG" \
-              --title "df-ai for DFHack 0.47.05-r8 (Build ${{ github.run_id }})" \
-              --notes "Automated build of df-ai targeting DFHack 0.47.05-r8. This build attempts to compile DFHack 0.47.05-r8 from source to use as an SDK. Please check build logs for success." \
-              "$ARTIFACT_PATH_FULL"
-          echo "::notice::Release creation attempted."
+        echo "::notice::Creating release $RELEASE_TAG and uploading $ARTIFACT_PATH_LOCAL as $ARTIFACT_UPLOAD_AS_NAME"
+        gh release create "$RELEASE_TAG" \
+            --title "df-ai for DFHack 0.47.05-r8 (Build ${{ steps.datetime.outputs.datetime }})" \
+            --notes "Automated build of df-ai (targeting DFHack 0.47.05-r8) by building as a plugin within the DFHack source tree. DFHack 0.47.05-r8 was cloned and its submodules initialized for this build. Please check build logs for success." \
+            "$ARTIFACT_PATH_LOCAL#$ARTIFACT_UPLOAD_AS_NAME" # Use # to specify a different display name for the asset
+        echo "::notice::Release creation attempted."
