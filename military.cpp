@@ -132,7 +132,7 @@ df::unit *AI::is_attacking_citizen(df::unit *u)
                 {
                     if (auto enemy = df::unit::find(enemy_id))
                     {
-                        if (Units::isSane(enemy) && Units::isCitizen(enemy))
+                        if (Units::isSane(enemy) && Units::isCitizen(enemy, true))
                         {
                             citizen = enemy;
                             return true;
@@ -152,7 +152,7 @@ df::unit *AI::is_hunting_target(df::unit *u)
 {
     for (auto c : world->units.active)
     {
-        if (Units::isSane(c) && Units::isCitizen(c) && u->job.current_job && u->job.current_job->job_type == job_type::Hunt && c->job.hunt_target == u)
+        if (Units::isSane(c) && Units::isCitizen(c, true) && u->job.current_job && u->job.current_job->job_type == job_type::Hunt && c->job.hunt_target == u)
         {
             return c;
         }

@@ -109,7 +109,7 @@ bool blueprint_plan_template::apply(Json::Value data, std::string & error)
             return false;
         }
 
-        std::vector<std::string> tag_names{ std::move(value.getMemberNames()) };
+        std::vector<std::string> tag_names{ value.getMemberNames() };
         for (auto & tag_name : tag_names)
         {
             Json::Value & tag = value[tag_name];
@@ -215,7 +215,7 @@ bool blueprint_plan_template::apply(Json::Value data, std::string & error)
             return false;
         }
 
-        std::vector<std::string> type_names{ std::move(value.getMemberNames()) };
+        std::vector<std::string> type_names{ value.getMemberNames() };
         for (auto & type_name : type_names)
         {
             Json::Value & type = value[type_name];
@@ -226,7 +226,7 @@ bool blueprint_plan_template::apply(Json::Value data, std::string & error)
             }
 
             auto & limits = instance_limits[type_name];
-            std::vector<std::string> instance_names{ std::move(type.getMemberNames()) };
+            std::vector<std::string> instance_names{ type.getMemberNames() };
             for (auto & instance_name : instance_names)
             {
                 Json::Value & limit = type[instance_name];

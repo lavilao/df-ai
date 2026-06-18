@@ -897,7 +897,7 @@ static Stocks::find_item_info find_item_helper_equip_helper(df::items_other_id o
     {
         if (auto u = Items::getHolderUnit(item))
         {
-            if (!Units::isCitizen(u))
+            if (!Units::isCitizen(u, true))
             {
                 return false;
             }

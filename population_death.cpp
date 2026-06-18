@@ -49,7 +49,7 @@ void Population::update_deads(color_ostream & out)
         {
             ai.stocks.queue_slab(out, u->hist_figure_id);
         }
-        else if (Units::isCitizen(u) && Units::isDead(u) && std::find_if(u->owned_buildings.begin(), u->owned_buildings.end(),
+        else if (Units::isCitizen(u, true) && Units::isDead(u) && std::find_if(u->owned_buildings.begin(), u->owned_buildings.end(),
             [](df::building *bld) -> bool { return bld->getType() == building_type::Coffin; }) != u->owned_buildings.end())
         {
             want_coffin++;

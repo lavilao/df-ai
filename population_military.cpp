@@ -692,7 +692,7 @@ void Population::update_military(color_ostream & out)
     {
         for (auto u : world->units.active)
         {
-            if (!Units::isCitizen(u) || !Units::isAdult(u) || !Units::isAlive(u) || !Units::isSane(u))
+            if (!Units::isCitizen(u, true) || !Units::isAdult(u) || !Units::isAlive(u) || !Units::isSane(u))
             {
                 continue;
             }
@@ -726,7 +726,7 @@ void Population::update_military(color_ostream & out)
         for (auto m : military)
         {
             auto u = df::unit::find(m.first);
-            if (!Units::isCitizen(u) || AI::is_in_conflict(u))
+            if (!Units::isCitizen(u, true) || AI::is_in_conflict(u))
             {
                 continue;
             }
@@ -749,7 +749,7 @@ void Population::update_military(color_ostream & out)
 
     for (auto u : world->units.active)
     {
-        if (Units::isCitizen(u))
+        if (Units::isCitizen(u, true))
         {
             for (auto trait : u->status.misc_traits)
             {

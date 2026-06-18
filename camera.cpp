@@ -201,7 +201,7 @@ void Camera::update(color_ostream &)
     for (auto it = world->units.active.begin(); it != world->units.active.end(); it++)
     {
         df::unit *u = *it;
-        if (!u->flags1.bits.inactive && Units::isCitizen(u))
+        if (!u->flags1.bits.inactive && Units::isCitizen(u, true))
         {
             DFAI_DEBUG(camera, 5, "adding candidate: " << AI::describe_unit(u) << " (citizen)");
             targets2.push_back(u);

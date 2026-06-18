@@ -68,7 +68,7 @@ public:
         std::vector<df::unit *> candidates;
         for (auto u : world->units.active)
         {
-            if (!Units::isCitizen(u) || Units::isChild(u) || Units::isBaby(u))
+            if (!Units::isCitizen(u, true) || Units::isChild(u) || Units::isBaby(u))
             {
                 continue;
             }

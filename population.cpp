@@ -162,7 +162,7 @@ void Population::update_citizenlist(color_ostream & out)
     // add new fort citizen to our list
     for (auto u : world->units.active)
     {
-        if (Units::isCitizen(u) && !Units::isBaby(u))
+        if (Units::isCitizen(u, true) && !Units::isBaby(u))
         {
             if (old.count(u->id))
             {
@@ -190,7 +190,7 @@ void Population::update_citizenlist(color_ostream & out)
                 }
             }
         }
-        else if (Units::isCitizen(u) && Units::isBaby(u))
+        else if (Units::isCitizen(u, true) && Units::isBaby(u))
         {
             auto mother = df::unit::find(u->relationship_ids[unit_relationship_type::Mother]);
             if (mother && Units::isAlive(mother) && Units::isSane(mother) && u->relationship_ids[unit_relationship_type::RiderMount] == -1 && mother->job.current_job == nullptr)
