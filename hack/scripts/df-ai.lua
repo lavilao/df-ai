@@ -91,21 +91,18 @@ function AI:load_modules()
 end
 
 function AI:is_dwarfmode_viewscreen()
-    local plotinfo = df.global.plotinfo
-    if not plotinfo then return false end
-    if plotinfo.main.mode ~= df.ui_sidebar_mode.Default then return false end
-    if #df.global.world.status.popups > 0 then return false end
-    local view = dfhack.gui.getCurViewscreen(false)
-    if not view then return false end
-    if dfhack.screen.isDismissed(view) then return false end
-    if not df.viewscreen_dwarfmodest:is_instance(view) then return false end
-    return true
+    local ok, view = pcall(function()
+        return dfhack.gui.getCurViewscreen(false)
+    end)
+    if not ok or not view then return false end
+    if df.viewscreen_dwarfmodest:is_instance(view) then return true end
+    return false
 end
 
 function AI:on_state_change(sc)
-    if sc == df.state_change_event.SC_MAP_LOADED then
+    if sc == SC_MAP_LOADED then
         self:startup()
-    elseif sc == df.state_change_event.SC_MAP_UNLOADED then
+    elseif sc == SC_MAP_UNLOADED then
         self:shutdown()
     end
 end
@@ -122,7 +119,11 @@ end
 
 function AI:shutdown()
     debug_log('AI shutting down')
-    repeatutil.cancel(GLOBAL_KEY)
+    repeatutil.cancel(GLOBAL_KEY .. '-plan')
+    repeatutil.cancel(GLOBAL_KEY .. '-pop')
+    repeatutil.cancel(GLOBAL_KEY .. '-pop-deathwatch')
+    repeatutil.cancel(GLOBAL_KEY .. '-stocks')
+    repeatutil.cancel(GLOBAL_KEY .. '-camera')
     self:clear()
 end
 
@@ -193,11 +194,11 @@ end
 local the_ai = nil
 
 dfhack.onStateChange[GLOBAL_KEY] = function(sc)
-    if sc == df.state_change_event.SC_MAP_LOADED then
+    if sc == SC_MAP_LOADED then
         if the_ai then
             the_ai:startup()
         end
-    elseif sc == df.state_change_event.SC_MAP_UNLOADED then
+    elseif sc == SC_MAP_UNLOADED then
         if the_ai then
             the_ai:shutdown()
         end
@@ -261,8 +262,10 @@ if dfhack_flags and dfhack_flags.enable then
             the_ai:init()
         end
         the_ai.enabled = true
-        local world = df.global.world
-        if world and world.map.block_count > 0 then
+        local ok, view = pcall(function()
+            return dfhack.gui.getCurViewscreen(true)
+        end)
+        if ok and view and df.viewscreen_dwarfmodest:is_instance(view) then
             the_ai:startup()
         end
         print('df-ai enabled')

@@ -29,7 +29,9 @@ function Population.new(ai)
 end
 
 function Population:startup()
-    df.global.standing_orders_forbid_used_ammo = 0
+    pcall(function()
+        df.global.standing_orders_forbid_used_ammo = 0
+    end)
 end
 
 function Population:update()
