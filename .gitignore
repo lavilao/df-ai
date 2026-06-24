@@ -1,2 +1,11 @@
 df-ai-git-describe.h
 df-ai-git-describe.tmp.h
+*.plug.so
+*.o
+*.obj
+*.lib
+CMakeCache.txt
+CMakeFiles/
+cmake-build-debug/
+cmake-build-release/
+build/
