@@ -4,42 +4,42 @@ local Population = {}
 Population.__index = Population
 
 local LABOR_IMPORTANT = {
-    [df.labor.MINING] = true,
-    [df.labor.CARPENTRY] = true,
-    [df.labor.MASONRY] = true,
-    [df.labor.ANIMALCARETAKING] = true,
-    [df.labor.FARMING] = true,
-    [df.labor.COOKING] = true,
-    [df.labor.BREWING] = true,
-    [df.labor.SMELTING] = true,
-    [df.labor.FURNACE_OPERATING] = true,
-    [df.labor.WOODCUTTING] = true,
-    [df.labor.ENGRAVING] = true,
-    [df.labor.MECHANICS] = true,
-    [df.labor.STRAND_EXTRACTION] = true,
-    [df.labor.GLASSMAKING] = true,
-    [df.labor.LEATHERWORKING] = true,
-    [df.labor.TANNING] = true,
-    [df.labor.WEAVING] = true,
-    [df.labor.CLOTHMAKING] = true,
-    [df.labor.SOAP_MAKING] = true,
-    [df.labor.POTASH_MAKING] = true,
-    [df.labor.LYE_MAKING] = true,
-    [df.labor.DYING] = true,
-    [df.labor.BUTCHERY] = true,
-    [df.labor.PROCESSING_PLANTS] = true,
-    [df.labor.MILLING] = true,
+    [df.unit_labor.MINING] = true,
+    [df.unit_labor.CARPENTRY] = true,
+    [df.unit_labor.MASONRY] = true,
+    [df.unit_labor.ANIMALCARETAKING] = true,
+    [df.unit_labor.FARMING] = true,
+    [df.unit_labor.COOKING] = true,
+    [df.unit_labor.BREWING] = true,
+    [df.unit_labor.SMELTING] = true,
+    [df.unit_labor.FURNACE_OPERATING] = true,
+    [df.unit_labor.WOODCUTTING] = true,
+    [df.unit_labor.ENGRAVING] = true,
+    [df.unit_labor.MECHANICS] = true,
+    [df.unit_labor.STRAND_EXTRACTION] = true,
+    [df.unit_labor.GLASSMAKING] = true,
+    [df.unit_labor.LEATHERWORKING] = true,
+    [df.unit_labor.TANNING] = true,
+    [df.unit_labor.WEAVING] = true,
+    [df.unit_labor.CLOTHMAKING] = true,
+    [df.unit_labor.SOAP_MAKING] = true,
+    [df.unit_labor.POTASH_MAKING] = true,
+    [df.unit_labor.LYE_MAKING] = true,
+    [df.unit_labor.DYING] = true,
+    [df.unit_labor.BUTCHERY] = true,
+    [df.unit_labor.PROCESSING_PLANTS] = true,
+    [df.unit_labor.MILLING] = true,
 }
 
 local LABOR_BASIC = {
-    [df.labor.CARPENTRY] = true,
-    [df.labor.MASONRY] = true,
-    [df.labor.MINING] = true,
-    [df.labor.WOODCUTTING] = true,
-    [df.labor.FARMING] = true,
-    [df.labor.COOKING] = true,
-    [df.labor.BREWING] = true,
-    [df.labor.HAULING] = true,
+    [df.unit_labor.CARPENTRY] = true,
+    [df.unit_labor.MASONRY] = true,
+    [df.unit_labor.MINING] = true,
+    [df.unit_labor.WOODCUTTING] = true,
+    [df.unit_labor.FARMING] = true,
+    [df.unit_labor.COOKING] = true,
+    [df.unit_labor.BREWING] = true,
+    [df.unit_labor.HAULING] = true,
 }
 
 -- Nobles we track
@@ -235,11 +235,11 @@ function Population:update_labors()
         local med_count = 0
         for _, v in pairs(self.medic) do if v then med_count = med_count + 1 end end
         if med_count < 3 then
-            unit.status.labors[df.labor.DIAGNOSIS] = true
-            unit.status.labors[df.labor.SURGERY] = true
-            unit.status.labors[df.labor.SETTING_BONE] = true
-            unit.status.labors[df.labor.SUTURING] = true
-            unit.status.labors[df.labor.DRESSING_WOUNDS] = true
+            unit.status.labors[df.unit_labor.DIAGNOSIS] = true
+            unit.status.labors[df.unit_labor.SURGERY] = true
+            unit.status.labors[df.unit_labor.SETTING_BONE] = true
+            unit.status.labors[df.unit_labor.SUTURING] = true
+            unit.status.labors[df.unit_labor.DRESSING_WOUNDS] = true
         end
     end
 end
