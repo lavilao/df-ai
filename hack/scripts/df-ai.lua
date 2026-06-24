@@ -76,18 +76,27 @@ function AI:init()
 end
 
 function AI:load_modules()
-    local ok_pop, pop = pcall(reqscript, 'df-ai.population')
-    if ok_pop then self.population = pop.new(self) end
-    local ok_plan, plan = pcall(reqscript, 'df-ai.plan')
-    if ok_plan then self.plan = plan.new(self) end
-    local ok_stocks, stocks = pcall(reqscript, 'df-ai.stocks')
-    if ok_stocks then self.stocks = stocks.new(self) end
-    local ok_cam, cam = pcall(reqscript, 'df-ai.camera')
-    if ok_cam then self.camera = cam.new(self) end
-    local ok_trade, trade = pcall(reqscript, 'df-ai.trade')
-    if ok_trade then self.trade = trade.new(self) end
-    local ok_emb, emb = pcall(reqscript, 'df-ai.embark')
-    if ok_emb then self.embark = emb.new(self) end
+    local mods = {
+        population = 'df-ai/population',
+        plan = 'df-ai/plan',
+        stocks = 'df-ai/stocks',
+        camera = 'df-ai/camera',
+        trade = 'df-ai/trade',
+        embark = 'df-ai/embark',
+    }
+    for key, path in pairs(mods) do
+        local ok, mod = pcall(dfhack.run_script_with_env, nil, path, {module=true})
+        if ok and type(mod) == 'table' and mod.new then
+            self[key] = mod.new(self)
+        else
+            debug_log('failed to load module ' .. path .. ': ' .. tostring(mod))
+        end
+    end
+    -- Load rooms module (not a class, just utility)
+    local ok, rooms = pcall(dfhack.run_script_with_env, nil, 'df-ai/rooms', {module=true})
+    if ok and type(rooms) == 'table' then
+        self.rooms_module = rooms
+    end
 end
 
 function AI:is_dwarfmode_viewscreen()
@@ -115,6 +124,7 @@ function AI:startup()
     if self.stocks then self.stocks:startup() end
     if self.camera then self.camera:startup() end
     self:register_repeating_tasks()
+    self:unpause()
 end
 
 function AI:shutdown()
@@ -191,6 +201,53 @@ function AI:report()
     return self:status()
 end
 
+function AI:spiral_search(origin, max_dist, min_dist, step, fn)
+    local min_d = min_dist or 0
+    local st = step or 1
+    for r = min_d, max_dist, st do
+        for dx = -r, r, st do
+            local x = origin.x + dx
+            for dy = -r, r, st do
+                local y = origin.y + dy
+                if math.abs(dx) == r or math.abs(dy) == r then
+                    local c = { x = x, y = y, z = origin.z }
+                    local ok, result = pcall(fn, c)
+                    if ok and result then
+                        return c
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+function AI:find_room(type, filter)
+    if not self.plan then return nil end
+    local rooms = self.plan.rooms
+    if not rooms then return nil end
+    for _, r in ipairs(rooms) do
+        if r.type == type then
+            if not filter or filter(r) then
+                return r
+            end
+        end
+    end
+    return nil
+end
+
+function AI:find_room_at(c)
+    if not self.plan then return nil end
+    local rooms = self.plan.rooms
+    if not rooms then return nil end
+    for _, r in ipairs(rooms) do
+        if r:include(c) then
+            return r
+        end
+    end
+    return nil
+end
+
 local the_ai = nil
 
 dfhack.onStateChange[GLOBAL_KEY] = function(sc)
@@ -262,10 +319,8 @@ if dfhack_flags and dfhack_flags.enable then
             the_ai:init()
         end
         the_ai.enabled = true
-        local ok, view = pcall(function()
-            return dfhack.gui.getCurViewscreen(true)
-        end)
-        if ok and view and df.viewscreen_dwarfmodest:is_instance(view) then
+        local ok, site = pcall(dfhack.world.getCurrentSite)
+        if ok and site then
             the_ai:startup()
         end
         print('df-ai enabled')

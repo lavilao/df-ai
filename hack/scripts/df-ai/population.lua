@@ -68,7 +68,7 @@ function Population:deathwatch()
 
     local total_dead = 0
     for _, unit in ipairs(all) do
-        if unit.flags1.dead then
+        if not dfhack.units.isAlive(unit) then
             total_dead = total_dead + 1
         end
     end
@@ -82,9 +82,9 @@ function Population:deathwatch()
 end
 
 function Population:update_trading()
-    local world = df.global.world
-    if not world then return end
-    local caravan = world.caravans
+    local ok, plotinfo = pcall(function() return df.global.plotinfo end)
+    if not ok or not plotinfo then return end
+    local caravan = plotinfo.caravans
     if not caravan then return end
     for _, c in ipairs(caravan) do
         if c.time_remaining and c.time_remaining > 0 then
