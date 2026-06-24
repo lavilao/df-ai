@@ -420,6 +420,8 @@ function Plan:_place_room_tag(tag, entrance)
     if target <= 0 then return end
 
     -- Place rooms in a radial pattern around entrance
+    local ws_type_idx = 0
+    local f_type_idx = 0
     for i = 1, math.min(target, #orientations) do
         local angle = (i - 1) * (2 * math.pi / math.min(target, 8)) + 0.1
         local radius = 12 + (i // 8) * 12
@@ -437,21 +439,39 @@ function Plan:_place_room_tag(tag, entrance)
         local tmpl_key = orientations[(i - 1) % #orientations + 1]
         local tmpl = self.templates[tmpl_key]
         if tmpl and tmpl.r then
+            -- Assign workshop/furnace type for this batch
+            local ws_types = WORKSHOP_TYPES_BY_SIZE[template_base]
+            ws_type_idx = ws_type_idx + 1
+            f_type_idx = f_type_idx + 1
+
             for _, r_data in ipairs(tmpl.r) do
                 if r_data.min and r_data.max then
                     local min_l, max_l = r_data.min, r_data.max
-                    local rm = rooms_module.room.new(r_data.type or template_base,
+                    local room_type = r_data.type
+                    if room_type == nil or room_type == 'None' then
+                        room_type = self:_tag_to_type(tag)
+                    end
+                    local kwargs = {
+                        corridor_type = r_data.corridor_type,
+                        outdoor = r_data.outdoor or false,
+                        level = oz + min_l[3],
+                    }
+                    if room_type == 'workshop' and r_data.stockpile_type == nil then
+                        if ws_types and #ws_types > 0 then
+                            kwargs.workshop_type = ws_types[((ws_type_idx - 1) % #ws_types) + 1]
+                        end
+                    elseif room_type == 'furnace' then
+                        kwargs.furnace_type = FURNACE_TYPES_LIST[((f_type_idx - 1) % #FURNACE_TYPES_LIST) + 1]
+                    elseif room_type == 'stockpile' and r_data.stockpile_type then
+                        kwargs.stockpile_type = r_data.stockpile_type
+                    elseif r_data.farm_type then
+                        kwargs.farm_type = r_data.farm_type
+                    end
+                    local rm = rooms_module.room.new(room_type,
                         { x = entrance.x + offset_x + min_l[1], y = entrance.y + offset_y + min_l[2], z = entrance.z + oz + min_l[3] },
                         { x = entrance.x + offset_x + max_l[1], y = entrance.y + offset_y + max_l[2], z = entrance.z + oz + max_l[3] },
-                        {
-                            corridor_type = r_data.corridor_type,
-                            outdoor = r_data.outdoor or false,
-                            level = oz + min_l[3],
-                        }
+                        kwargs
                     )
-                    if r_data.workshop_type and rooms_module.TYPE and rooms_module.TYPE[r_data.workshop_type] then
-                        -- Map string workshop type to df enum
-                    end
                     if r_data.accesspath then rm.accesspath = r_data.accesspath end
 
                     -- Load furniture
@@ -810,7 +830,35 @@ function Plan:start_processing_generic()
                 del = self_ref:try_construct_windmill(t.room)
             elseif t.type == TASK_TYPE.check_rooms then
                 self_ref:checkrooms()
+            elseif t.type == TASK_TYPE.check_construct then
+                if t.room and t.room.bld_id >= 0 then
+                    if not df.building.find(t.room.bld_id) then
+                        t.room.bld_id = -1
+                        self_ref:construct_room(t.room)
+                    end
+                end
+                del = true
+            elseif t.type == TASK_TYPE.check_furnish then
+                if t.room then
+                    local any_furnish = false
+                    for _, f in ipairs(t.room.layout) do
+                        if f.bld_id < 0 and not f.ignore then
+                            self_ref:add_task(TASK_TYPE.furnish, t.room, f)
+                            any_furnish = true
+                        end
+                    end
+                    if not any_furnish and t.room.status == 'finished' then
+                        t.room.furnished = true
+                    end
+                end
+                del = true
             elseif t.type == TASK_TYPE.check_idle then
+            elseif t.type == TASK_TYPE.furnish then
+                if t.room and t.furniture then
+                    del = self_ref:try_furnish(t.room, t.furniture)
+                else
+                    del = true
+                end
             end
 
             t.last_status = reason
@@ -820,6 +868,27 @@ function Plan:start_processing_generic()
 end
 
 function Plan:start_processing_furniture()
+    local self_ref = self
+    dfhack.onStateChange['df-ai-furn-bg'] = function(sc)
+        if sc == SC_VIEWSCREEN_CHANGED then
+            if self_ref.bg_idx_furniture == nil then return end
+            if self_ref.bg_idx_furniture > #self_ref.tasks_furniture then
+                self_ref.bg_idx_furniture = nil
+                return
+            end
+            local t = self_ref.tasks_furniture[self_ref.bg_idx_furniture]
+            if not t then
+                self_ref.bg_idx_furniture = self_ref.bg_idx_furniture + 1
+                return
+            end
+            if t.type == TASK_TYPE.furnish then
+                if t.room and t.furniture then
+                    self_ref:try_furnish(t.room, t.furniture)
+                end
+            end
+            self_ref.bg_idx_furniture = self_ref.bg_idx_furniture + 1
+        end
+    end
 end
 
 -- ============================================================
@@ -966,6 +1035,16 @@ function Plan:construct_room(r)
     else
         self:add_task(TASK_TYPE.check_furnish, r)
     end
+    -- Verify construction after placement
+    self:add_task(TASK_TYPE.check_construct, r)
+    -- Queue furnishing
+    if r.layout and #r.layout > 0 then
+        for _, f in ipairs(r.layout) do
+            if not f.ignore then
+                self:add_task(TASK_TYPE.furnish, r, f)
+            end
+        end
+    end
 end
 
 local BUILDING_TYPES = {
@@ -1012,6 +1091,52 @@ local BUILDING_TYPES = {
     },
 }
 
+local WORKSHOP_TYPES_BY_SIZE = {
+    ['generic01_workshop_1x1'] = {
+        df.workshop_type.Butchers,
+        df.workshop_type.Quern,
+        df.workshop_type.Tanners,
+        df.workshop_type.Bowyers,
+    },
+    ['generic01_workshop_3x3'] = {
+        df.workshop_type.Farmers,
+        df.workshop_type.Kitchen,
+        df.workshop_type.Still,
+        df.workshop_type.Loom,
+        df.workshop_type.Clothiers,
+        df.workshop_type.Leatherworks,
+        df.workshop_type.Craftsdwarf,
+        df.workshop_type.Masons,
+        df.workshop_type.Carpenters,
+        df.workshop_type.Jewelers,
+        df.workshop_type.Dyers,
+        df.workshop_type.Mechanics,
+    },
+    ['generic01_workshop_5x5'] = {
+        df.workshop_type.Siege,
+        df.workshop_type.ScrewPress,
+    },
+}
+
+local FURNACE_TYPES_LIST = {
+    df.furnace_type.Smelter,
+    df.furnace_type.WoodFurnace,
+    df.furnace_type.Kiln,
+    df.furnace_type.GlassFurnace,
+    df.furnace_type.MagmaSmelter,
+    df.furnace_type.MagmaKiln,
+    df.furnace_type.MagmaGlassFurnace,
+}
+
+function Plan:find_building_at(pos, building_type_name)
+    for _, bld in ipairs(df.global.world.buildings.all) do
+        if bld.z_level == pos.z and bld.centerx == pos.x and bld.centery == pos.y then
+            return bld.id, bld
+        end
+    end
+    return -1, nil
+end
+
 function Plan:try_construct_workshop(r)
     if not r then return false end
     local pos = r:pos()
@@ -1027,8 +1152,18 @@ function Plan:try_construct_workshop(r)
     end
     if not type_name then return false end
 
+    local bld_id = r.bld_id
+    if bld_id >= 0 and df.building.find(bld_id) then
+        return true
+    end
+
     local cmd = string.format('building/create-building %s %d %d %d', type_name, pos.x, pos.y, pos.z)
     dfhack.run_command(cmd)
+
+    local id = self:find_building_at(pos)
+    if id >= 0 then
+        r.bld_id = id
+    end
     return true
 end
 
@@ -1047,49 +1182,197 @@ function Plan:try_construct_furnace(r)
     end
     if not type_name then return false end
 
+    local bld_id = r.bld_id
+    if bld_id >= 0 and df.building.find(bld_id) then
+        return true
+    end
+
     local cmd = string.format('building/create-building %s %d %d %d', type_name, pos.x, pos.y, pos.z)
     dfhack.run_command(cmd)
+
+    local id = self:find_building_at(pos)
+    if id >= 0 then
+        r.bld_id = id
+    end
     return true
 end
 
 function Plan:try_construct_stockpile(r)
     if not r then return false end
     local pos = r:pos()
+
+    local bld_id = r.bld_id
+    if bld_id >= 0 and df.building.find(bld_id) then
+        return true
+    end
+
     local cmd = string.format('building/create-building Stockpile %d %d %d', pos.x, pos.y, pos.z)
     dfhack.run_command(cmd)
+
+    local id, bld = self:find_building_at(pos)
+    if id >= 0 then
+        r.bld_id = id
+        self:configure_stockpile(bld, r.stockpile_type)
+    end
     return true
+end
+
+function Plan:configure_stockpile(bld, stype)
+    if not bld or not stype then return end
+    -- Enable/disable stockpile settings based on type
+    -- bld is a df.building_stockpilest
+    if not bld.settings then return end
+    local s = bld.settings
+
+    -- Reset all to false first
+    for _, group in ipairs(s) do
+        for i = 0, #group - 1 do
+            group[i] = false
+        end
+    end
+
+    local enable_map = {
+        food = { food = true },
+        furniture = { furniture = true },
+        wood = { wood = true },
+        stone = { stone = true },
+        refuse = { refuse = true },
+        corpses = { corpses = true },
+        animals = { animals = true, live_stock = true },
+        gems = { gems = true },
+        finished_goods = { finished_goods = true },
+        cloth = { cloth = true },
+        bars_blocks = { bars = true, blocks = true },
+        leather = { leather = true, cloth = true },
+        ammo = { ammo = true, ranged_weapons = true, weapons = true },
+        armor = { armor = true },
+        weapons = { weapons = true, ammo = true, ranged_weapons = true },
+        coins = { coins = true, bars = true },
+        sheets = { cloth = true },
+        fresh_raw_hide = { raw_hides = true, leather = true },
+    }
+
+    local enable = enable_map[stype]
+    if not enable then
+        enable = {}
+        if s[0] then
+            for i = 0, #s[0] - 1 do
+                enable[i] = true
+            end
+        end
+    end
+
+    if s[0] then
+        for i = 0, #s[0] - 1 do
+            if enable[i] then
+                s[0][i] = true
+            end
+        end
+    end
+    if s[1] then
+        for i = 0, #s[1] - 1 do
+            if enable[i] then
+                s[1][i] = true
+            end
+        end
+    end
 end
 
 function Plan:try_construct_farmplot(r)
     if not r then return false end
     local pos = r:pos()
+
+    local bld_id = r.bld_id
+    if bld_id >= 0 and df.building.find(bld_id) then
+        return true
+    end
+
     local cmd = string.format('building/create-building FarmPlot %d %d %d', pos.x, pos.y, pos.z)
     dfhack.run_command(cmd)
+
+    local id, bld = self:find_building_at(pos)
+    if id >= 0 then
+        r.bld_id = id
+        -- Enable all seasons for farming
+        if bld then
+            bld.seasons[0] = true
+            bld.seasons[1] = true
+            bld.seasons[2] = true
+            bld.seasons[3] = true
+            bld.plant_now = true
+        end
+    end
     return true
 end
 
 function Plan:try_construct_activityzone(r)
     if not r then return false end
     local pos = r:pos()
-    if r.type == 'pasture' or r.type == 'pond' then
-        dfhack.run_command('zone set ' .. pos.x .. ' ' .. pos.y .. ' ' .. pos.z)
+
+    local bld_id = r.bld_id
+    if bld_id >= 0 and df.building.find(bld_id) then
+        return true
     end
+
+    -- Create activity zone via DF API
+    local zone = df.building_activityzonest:new()
+    zone.centerx = pos.x
+    zone.centery = pos.y
+    zone.z_level = pos.z
+    zone:setSize(1, 1)
+    zone.is_room = false
+    zone.id = df.global.world.buildings.next_id
+    df.global.world.buildings.next_id = df.global.world.buildings.next_id + 1
+    df.global.world.buildings.all:insert(#df.global.world.buildings.all, zone)
+    df.global.world.buildings_by_id[zone.id] = zone
+
+    if r.type == 'pasture' then
+        zone.zone_flags.pasture = true
+    elseif r.type == 'pond' then
+        zone.zone_flags.pond = true
+    else
+        zone.zone_flags.gathering = true
+    end
+
+    r.bld_id = zone.id
     return true
 end
 
 function Plan:try_construct_tradedepot(r)
     if not r then return false end
     local pos = r:pos()
+
+    local bld_id = r.bld_id
+    if bld_id >= 0 and df.building.find(bld_id) then
+        return true
+    end
+
     local cmd = string.format('building/create-building TradeDepot %d %d %d', pos.x, pos.y, pos.z)
     dfhack.run_command(cmd)
+
+    local id = self:find_building_at(pos)
+    if id >= 0 then
+        r.bld_id = id
+    end
     return true
 end
 
 function Plan:try_construct_windmill(r)
     if not r then return false end
     local pos = r:pos()
+
+    local bld_id = r.bld_id
+    if bld_id >= 0 and df.building.find(bld_id) then
+        return true
+    end
+
     local cmd = string.format('building/create-building Windmill %d %d %d', pos.x, pos.y, pos.z)
     dfhack.run_command(cmd)
+
+    local id = self:find_building_at(pos)
+    if id >= 0 then
+        r.bld_id = id
+    end
     return true
 end
 
@@ -1102,6 +1385,10 @@ function Plan:try_furnish(r, f)
     local pos = f.pos
     if not pos then
         pos = r:pos()
+    end
+
+    if f.bld_id >= 0 and df.building.find(f.bld_id) then
+        return true
     end
 
     local name_map = {
@@ -1140,7 +1427,14 @@ function Plan:try_furnish(r, f)
 
     local cmd = string.format('building/create-building %s %d %d %d', type_name, pos.x, pos.y, pos.z)
     dfhack.run_command(cmd)
-    f.bld_id = -1
+
+    -- Find the building at this position
+    local id = self:find_building_at(pos)
+    if id >= 0 then
+        f.bld_id = id
+    else
+        f.bld_id = -1
+    end
     return true
 end
 

@@ -277,13 +277,18 @@ function room:dig_mode(c)
 end
 
 function room:dig()
-    for x = self.min.x, self.max.x do
-        for y = self.min.y, self.max.y do
-            local tile = dfhack.maps.getTileBlock(x, y, self.min.z)
-            if tile then
-                local des = tile.designation[x % 16][y % 16]
-                if des and des.dig == df.tile_dig_designation.No then
-                    des.dig = self:dig_mode(coord_new(x, y, 0))
+    for z = self.min.z, self.max.z do
+        for x = self.min.x, self.max.x do
+            for y = self.min.y, self.max.y do
+                local tile = dfhack.maps.getTileBlock(x, y, z)
+                if tile then
+                    local des = tile.designation[x % 16][y % 16]
+                    if des and des.dig == df.tile_dig_designation.No then
+                        des.dig = self:dig_mode(coord_new(x, y, z))
+                        if not tile.flags.designated then
+                            tile.flags.designated = true
+                        end
+                    end
                 end
             end
         end
@@ -291,13 +296,15 @@ function room:dig()
 end
 
 function room:is_dug()
-    for x = self.min.x, self.max.x do
-        for y = self.min.y, self.max.y do
-            local tile = dfhack.maps.getTileBlock(x, y, self.min.z)
-            if tile then
-                local des = tile.designation[x % 16][y % 16]
-                if des and des.dig ~= df.tile_dig_designation.No then
-                    return false
+    for z = self.min.z, self.max.z do
+        for x = self.min.x, self.max.x do
+            for y = self.min.y, self.max.y do
+                local tile = dfhack.maps.getTileBlock(x, y, z)
+                if tile then
+                    local des = tile.designation[x % 16][y % 16]
+                    if des and des.dig ~= df.tile_dig_designation.No then
+                        return false
+                    end
                 end
             end
         end
@@ -306,11 +313,23 @@ function room:is_dug()
 end
 
 function room:constructions_done()
-    -- Check if all constructions (walls, floors) are built
-    -- For now, simplified: check if DF building exists for this room
+    if self.type == 'corridor' then
+        return true
+    end
     if self.bld_id >= 0 then
         local bld = df.building.find(self.bld_id)
-        return bld ~= nil
+        if bld then
+            return true
+        end
+        self.bld_id = -1
+    end
+    -- Fallback: scan buildings at our position
+    local pos = self:pos()
+    for _, bld in ipairs(df.global.world.buildings.all) do
+        if bld.z_level == pos.z and bld.centerx == pos.x and bld.centery == pos.y then
+            self.bld_id = bld.id
+            return true
+        end
     end
     return false
 end
