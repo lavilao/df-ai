@@ -1,3 +1,5 @@
+--@module = true
+
 local Trade = {}
 Trade.__index = Trade
 

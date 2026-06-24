@@ -1,3 +1,5 @@
+--@module = true
+
 local Plan = {}
 Plan.__index = Plan
 
@@ -142,9 +144,9 @@ function Plan:check_room(room)
         local all_dug = true
         for x = room.min.x, room.max.x do
             for y = room.min.y, room.max.y do
-                local tile = dfhack.maps.getTileBlock({x = x, y = y, z = room.min.z})
-                if tile then
-                    local designation = tile.designation[x % 16][y % 16]
+                local block = dfhack.maps.getBlock(x, y, room.min.z)
+                if block then
+                    local designation = block.designation[x % 16][y % 16]
                     if designation and designation.dig ~= df.tile_dig_designation.No then
                         all_dug = false
                         break
@@ -178,10 +180,9 @@ function Plan:execute_dig(task)
 
     for x = room.min.x, room.max.x do
         for y = room.min.y, room.max.y do
-            local pos = { x = x, y = y, z = room.min.z }
-            local tile = dfhack.maps.getTileBlock(pos)
-            if tile then
-                local des = tile.designation[x % 16][y % 16]
+            local block = dfhack.maps.getBlock(x, y, room.min.z)
+            if block then
+                local des = block.designation[x % 16][y % 16]
                 if des and des.dig == df.tile_dig_designation.No then
                     des.dig = df.tile_dig_designation.Default
                 end

@@ -76,12 +76,18 @@ function AI:init()
 end
 
 function AI:load_modules()
-    self.population = require('df-ai.population').new(self)
-    self.plan = require('df-ai.plan').new(self)
-    self.stocks = require('df-ai.stocks').new(self)
-    self.camera = require('df-ai.camera').new(self)
-    self.trade = require('df-ai.trade').new(self)
-    self.embark = require('df-ai.embark').new(self)
+    local ok_pop, pop = pcall(reqscript, 'df-ai.population')
+    if ok_pop then self.population = pop.new(self) end
+    local ok_plan, plan = pcall(reqscript, 'df-ai.plan')
+    if ok_plan then self.plan = plan.new(self) end
+    local ok_stocks, stocks = pcall(reqscript, 'df-ai.stocks')
+    if ok_stocks then self.stocks = stocks.new(self) end
+    local ok_cam, cam = pcall(reqscript, 'df-ai.camera')
+    if ok_cam then self.camera = cam.new(self) end
+    local ok_trade, trade = pcall(reqscript, 'df-ai.trade')
+    if ok_trade then self.trade = trade.new(self) end
+    local ok_emb, emb = pcall(reqscript, 'df-ai.embark')
+    if ok_emb then self.embark = emb.new(self) end
 end
 
 function AI:is_dwarfmode_viewscreen()
@@ -116,7 +122,7 @@ end
 
 function AI:shutdown()
     debug_log('AI shutting down')
-    repeatUtil.cancel(GLOBAL_KEY)
+    repeatutil.cancel(GLOBAL_KEY)
     self:clear()
 end
 

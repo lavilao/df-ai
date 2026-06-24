@@ -1,3 +1,5 @@
+--@module = true
+
 local Population = {}
 Population.__index = Population
 
@@ -24,7 +26,7 @@ function Population.new(ai)
     }
     setmetatable(o, Population)
     return o
-}
+end
 
 function Population:startup()
     df.global.standing_orders_forbid_used_ammo = 0

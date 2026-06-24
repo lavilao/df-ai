@@ -1,3 +1,5 @@
+--@module = true
+
 local Stocks = {}
 Stocks.__index = Stocks
 

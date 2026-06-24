@@ -1,3 +1,5 @@
+--@module = true
+
 local Camera = {}
 Camera.__index = Camera
 

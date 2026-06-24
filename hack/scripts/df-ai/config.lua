@@ -1,3 +1,5 @@
+--@module = true
+
 local config = {}
 
 local function default_config()

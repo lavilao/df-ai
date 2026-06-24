@@ -1,3 +1,5 @@
+--@module = true
+
 local Embark = {}
 Embark.__index = Embark
 
