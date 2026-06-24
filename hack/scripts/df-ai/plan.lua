@@ -1010,6 +1010,49 @@ function Plan:checkroom(r)
             end
         end
     end
+
+    -- Room value monitoring: queue smoothing if value too low
+    if r.status == 'finished' and r.required_value > 0 then
+        local val = r:compute_value()
+        if val < r.required_value then
+            self:smooth_room(r)
+        end
+    end
+
+    -- Furnish check: queue furnishing for dug rooms
+    if r.status == 'dug' or r.status == 'finished' then
+        if not r.furnished and #r.layout > 0 then
+            for _, f in ipairs(r.layout) do
+                if f.bld_id < 0 and not f.ignore then
+                    self:add_task(TASK_TYPE.furnish, r, f)
+                end
+            end
+            r.furnished = true
+        end
+    end
+end
+
+function Plan:smooth_room(r)
+    if not r then return end
+    -- Queue smoothing jobs for all diggable tiles in the room
+    for x = r.min.x, r.max.x do
+        for y = r.min.y, r.max.y do
+            for z = r.min.z, r.max.z do
+                local block = dfhack.maps.getTileBlock(x, y, z)
+                if block then
+                    local tile = block.tiletype[x % 16][y % 16]
+                    local attrs = df.tiletype.attrs[tile]
+                    if attrs and attrs.shape == df.tiletype_shape.Wall then
+                        -- Queue smooth designation
+                        local des = block.designation[x % 16][y % 16]
+                        if des then
+                            des.smooth = true
+                        end
+                    end
+                end
+            end
+        end
+    end
 end
 
 -- ============================================================

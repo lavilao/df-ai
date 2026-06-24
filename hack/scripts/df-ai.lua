@@ -170,6 +170,10 @@ function AI:register_repeating_tasks()
             if self.camera then self.camera:update() end
         end)
     end
+    -- Announcement watcher
+    repeatutil.scheduleEvery(GLOBAL_KEY .. '-announce', 10, 'ticks', function()
+        self:watch_announcements()
+    end)
 end
 
 function AI:unpause()
@@ -181,6 +185,44 @@ end
 function AI:abandon()
     debug_log('abandoning fortress')
     dfhack.run_command('die')
+end
+
+function AI:watch_announcements()
+    local world = df.global.world
+    if not world or not world.status then return end
+    local announcements = world.status.announcements
+    if not announcements then return end
+
+    for _, ann in ipairs(announcements) do
+        if ann.flags and (ann.flags.danger or ann.flags.attack) then
+            -- Mark hostile creatures nearby
+            self:tag_enemies()
+            if ann.type then
+                local type_name = tostring(ann.type) or 'unknown'
+                debug_log('Danger: ' .. type_name)
+            end
+        end
+    end
+end
+
+function AI:tag_enemies()
+    local world = df.global.world
+    if not world then return end
+    local units = world.units.all
+    if not units then return end
+
+    for _, unit in ipairs(units) do
+        if unit.civ_id ~= df.global.ui.civ_id and dfhack.units.isAlive(unit) then
+            local pos = dfhack.units.getPosition(unit)
+            if pos then
+                dfhack.run_command('tag ' .. unit.id)
+                -- Follow hostile if camera is enabled
+                if self.camera and self.camera.enabled then
+                    self.camera:follow_unit(unit.id)
+                end
+            end
+        end
+    end
 end
 
 function AI:status()
