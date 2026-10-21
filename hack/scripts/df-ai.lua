@@ -314,7 +314,7 @@ local function print_status()
 end
 
 local function print_version()
-    print('df-ai Lua rewrite for DF 53.14')
+    print('df-ai Lua rewrite for DF 53.16 (DFHack 53.16-r3)')
     print('Based on BenLubar/df-ai')
 end
 

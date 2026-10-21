@@ -103,3 +103,40 @@ Stage Summary:
 - Integration test blocker: v50 embark screen input in headless Xvfb env — zoomed local view ignores ALL synthetic input (env limitation, not a df-ai issue).
 - Documented assets: 20+ flow scripts (flow*.sh, qc*.sh), screenshots in captures/, all UI coordinates mapped.
 - Next session options: (a) real XI2 event injection client (python-xlib), (b) pre-made fortress save hunt (DFFD/forums), (c) Xorg-dummy display server instead of Xvfb, (d) DFHack-native embark assistance via C++ plugin.
+
+---
+Task ID: 5
+Agent: main (Z.ai)
+Task: Session 4 — GitHub delivery: push branch, CI "build" (validate+package) workflow, installable release
+
+Work Log:
+- User request: push code to GitHub so they can test on a real display, plus a GitHub Action that "compiles" the plugin (user cannot compile locally).
+- Key point: the port is pure Lua — nothing to compile. The Action validates + packages instead (and this is BETTER for the user: ready-to-extract archive).
+- Fixed df-ai.lua version string: "Lua rewrite for DF 53.14" -> "Lua rewrite for DF 53.16 (DFHack 53.16-r3)".
+- Built and verified the release package layout in the live DF install:
+  * df-ai-blueprints/plans/ <- repo plans/
+  * df-ai-blueprints/templates/ <- repo rooms/templates/ (30 dirs, 82 JSON)
+  * hack/scripts/df-ai.lua + df-ai/ (already symlinked in test env)
+- BUG FIXED in plan.lua load_blueprint: dfhack.filesystem.listdir on a MISSING dir does NOT error — pcall succeeds and returns nil -> ipairs(nil) crashed the loader at line 219 whenever a template_bases entry had no directory (e.g. generic01_farmplot). Rewrote the template loader:
+  * type-check listdir result (nil-safe)
+  * try BOTH layouts: df-ai-blueprints/templates/<base>/ (release) and df-ai-blueprints/rooms/templates/<base>/ (repo checkout)
+  * per-file decode with per-file error reporting
+  * loud warning when 0 templates load (tells user to extract df-ai-blueprints/)
+  * removed dead known_files/alt_dir fallback code
+- Result (live DF 53.16-r3 headless boot test): plan config + 82/82 templates load, stocks/population modules OK, enable df-ai works, df-ai version/status work.
+- Built test/ci_smoke.lua: standalone module-load smoke test with a mocked DFHack API (auto-vivifying metatables for df.*/dfhack.*, real sibling-script loading for run_script_with_env, moduleMode emulation, package.loaded mocks for utils/json/repeat-util). Catches load-time runtime errors, not just syntax.
+- Downloaded lua5.3 5.3.6 (exact match of DFHack 53.16-r3 embedded Lua) via apt-get download into local-libs/lua53 (no root) for local harness validation.
+- ci_smoke.lua local result: 11/11 modules OK + main module-guard OK + AI:new()+init() wires 6/6 runtime modules. One harness bug fixed (AI:new() needs colon-call).
+- All 12 .lua files pass luac5.3 -p.
+- Created .github/workflows/build.yml:
+  * triggers: push (lua-53.16-r3, lua-rewrite-53.14, main, develop), tags v*, PRs, manual
+  * job build: luac5.3 -p syntax check -> ci_smoke.lua smoke test -> JSON validation (plans/rooms/schemas) -> package zip+tar.gz -> upload artifact (90d retention)
+  * job release (tags only): attaches archives to a GitHub Release via softprops/action-gh-release@v2
+- Created INSTALL.md (bilingual ES/EN): release-zip install path, git-checkout install path, commands table, port status expectations, why-Lua explainer.
+- Simulated the workflow packaging step locally: 97 files, zip 104KB / tar.gz 50KB, structure matches the boot-tested layout.
+
+Stage Summary:
+- Branch lua-53.16-r3 pushed to origin (first push of the port branch).
+- Tag v53.16-r3.1 pushed -> triggers CI -> publishes installable release df-ai-53.16-r3.zip.
+- User testing path: GitHub Releases -> download zip -> extract into DF folder -> enable df-ai -> load/embark fortress on real display.
+- Known follow-ups: 'tag' command used in tag_enemies may not exist in stock DFHack 53.16 (verify); embark module not wired into runtime loop (auto-embark off by design for now); in-fortress behavior is the testing focus.

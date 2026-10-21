@@ -161,73 +161,43 @@ function Plan:load_blueprint()
     }
 
     for _, base in ipairs(template_bases) do
-        local dir = 'df-ai-blueprints/templates/' .. base .. '/'
-        local files = {}
-        local ok_list, result = pcall(dfhack.filesystem.listdir, dir)
-        if ok_list then
-            files = result
-        else
-            -- Fallback: try to read known files directly
-            local known_files = {
-                generic01_start = {'stairs.json'},
-                generic01_bedroom = {'east.json','north.json','south.json','west.json'},
-                generic01_bedrooms = {'generic.json'},
-                generic01_corridor = {'east.json','north.json','south.json','west.json',
-                    'east_north.json','east_south.json','north_east.json','north_west.json',
-                    'south_east.json','south_west.json','west_north.json','west_south.json',
-                    'east_stockpile.json','west_stockpile.json'},
-                generic01_corridor_stair = {'generic.json'},
-                generic01_workshop_3x3 = {'generic.json'},
-                generic01_workshop_5x5 = {'generic.json'},
-                generic01_workshop_1x1 = {'generic.json'},
-                generic01_stockpile = {'generic.json'},
-                generic01_farmplot = {'generic.json'},
-                generic01_barracks = {'north.json','south.json'},
-                generic01_dininghall = {'generic.json'},
-                generic01_dormitory = {'generic.json'},
-                generic01_nobleroom = {'generic.json'},
-                generic01_infirmary = {'generic.json'},
-                generic01_jail = {'generic.json'},
-                generic01_cemetery = {'generic.json'},
-                generic01_location = {'guildhall.json','library.json','tavern.json','temple.json'},
-                generic01_depot = {'generic.json'},
-                generic01_outpost_entrance = {'generic.json'},
-                generic01_mineshaft = {'generic.json'},
-                generic01_mineshaft_segment = {'generic.json'},
-                generic01_pasture = {'generic.json'},
-                generic01_pitting_tower = {'generic.json'},
-                generic01_cage_trap = {'generic.json'},
-                generic01_outdoor_farm = {'food.json','cloth.json'},
-                generic01_apiary = {'generic.json'},
-                generic01_well = {'generic.json'},
-                generic01_stair = {'generic.json'},
-                generic01_underground_farm_start = {'generic.json'},
-                generic01_underground_farm_extension = {'generic.json'},
-            }
-            files = known_files[base] or {}
-            for _, fname in ipairs(files) do
-                -- Try with explicit path
-                local ok_f, _ = pcall(function() return json.decode_file(dir .. fname) end)
-                if not ok_f then
-                    -- Try alternative path
-                    local alt_dir = 'df-ai-blueprints/rooms/templates/' .. base .. '/'
-                    pcall(function() end)
+        -- Two supported layouts, tried in order:
+        --   1. Release package: df-ai-blueprints/templates/<base>/
+        --   2. Repo checkout:    df-ai-blueprints/rooms/templates/<base>/
+        -- NOTE: dfhack.filesystem.listdir on a missing dir does NOT error —
+        -- it returns nil. Always type-check the result.
+        local loaded_any = false
+        for _, dir in ipairs({
+            'df-ai-blueprints/templates/' .. base .. '/',
+            'df-ai-blueprints/rooms/templates/' .. base .. '/',
+        }) do
+            local ok_list, result = pcall(dfhack.filesystem.listdir, dir)
+            if ok_list and type(result) == 'table' then
+                for _, fname in ipairs(result) do
+                    if fname:match('%.json$') then
+                        local ok_t, tmpl = pcall(json.decode_file, dir .. fname)
+                        if ok_t and tmpl then
+                            local key = base .. '/' .. fname:gsub('%.json$', '')
+                            self.templates[key] = tmpl
+                            loaded_any = true
+                        else
+                            dfhack.println('[df-ai] warning: bad template JSON: ' .. dir .. fname)
+                        end
+                    end
                 end
+                break -- first layout that exists wins
             end
-            -- Use explicit file list as fallback
         end
-        for _, fname in ipairs(files) do
-            if fname:match('%.json$') then
-                local ok_t, tmpl = pcall(json.decode_file, dir .. fname)
-                if ok_t and tmpl then
-                    local key = base .. '/' .. fname:gsub('%.json$', '')
-                    self.templates[key] = tmpl
-                end
-            end
+        if not loaded_any then
+            dfhack.println('[df-ai] note: no templates for ' .. base .. ' (skipped)')
         end
     end
 
-    dfhack.println('[df-ai] Loaded plan config + ' .. self:_count_templates() .. ' templates')
+    local n_templates = self:_count_templates()
+    dfhack.println('[df-ai] Loaded plan config + ' .. n_templates .. ' templates')
+    if n_templates == 0 then
+        dfhack.println('[df-ai] WARNING: no room templates found. Make sure the df-ai-blueprints/ folder is inside your Dwarf Fortress directory.')
+    end
 end
 
 function Plan:_count_templates()

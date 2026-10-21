@@ -1,0 +1,142 @@
+name: Build df-ai package
+
+# df-ai for DF 53.16 is a pure-Lua plugin: there is nothing to compile in
+# the C++ sense. This workflow is the "build": it validates every script
+# with lua5.3 (the exact Lua version DFHack 53.16-r3 embeds), runs a
+# module-load smoke test against a mock DFHack API, validates all JSON
+# data, and packages a ready-to-install archive attached to every run and
+# to tagged releases.
+
+on:
+  push:
+    branches:
+      - lua-53.16-r3
+      - lua-rewrite-53.14
+      - main
+      - develop
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Validate + package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install lua5.3 (DFHack 53.16-r3 embeds Lua 5.3.6)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends lua5.3 zip
+
+      - name: Syntax-check all Lua scripts
+        run: |
+          set -e
+          fail=0
+          while IFS= read -r -d '' f; do
+            if luac5.3 -p "$f"; then
+              echo "OK   $f"
+            else
+              echo "FAIL $f"
+              fail=1
+            fi
+          done < <(find hack/scripts -name '*.lua' -print0)
+          exit $fail
+
+      - name: Module-load smoke test (mock DFHack API)
+        run: lua5.3 test/ci_smoke.lua
+
+      - name: Validate JSON data (plans, room templates, schemas)
+        run: |
+          python3 - <<'EOF'
+          import glob, json, sys
+          files = (glob.glob('plans/**/*.json', recursive=True)
+                   + glob.glob('rooms/**/*.json', recursive=True)
+                   + glob.glob('schemas/*.json'))
+          bad = []
+          for f in files:
+              try:
+                  with open(f, encoding='utf-8') as fh:
+                      json.load(fh)
+              except Exception as e:
+                  bad.append(f'{f}: {e}')
+          print(f'{len(files)} JSON files checked')
+          if bad:
+              print('\n'.join(bad))
+              sys.exit(1)
+          EOF
+
+      - name: Build installable package
+        run: |
+          set -e
+          PKG="df-ai-53.16-r3"
+          rm -rf dist && mkdir -p "dist/$PKG/hack/scripts" "dist/$PKG/df-ai-blueprints"
+
+          # Lua plugin scripts -> hack/scripts/ (drop straight into a DF install)
+          cp -r hack/scripts/df-ai.lua hack/scripts/df-ai "dist/$PKG/hack/scripts/"
+
+          # Fortress blueprints -> df-ai-blueprints/ at the DF root
+          cp -r plans "dist/$PKG/df-ai-blueprints/plans"
+          cp -r rooms/templates "dist/$PKG/df-ai-blueprints/templates"
+
+          # Docs
+          cp INSTALL.md LICENSE README.md "dist/$PKG/" 2>/dev/null || true
+
+          echo "Package contents:"
+          find "dist/$PKG" -type f | sort | sed "s|^dist/||"
+
+          pushd dist
+          zip -qr "$PKG.zip" "$PKG"
+          tar -czf "$PKG.tar.gz" "$PKG"
+          popd
+          sha256sum dist/$PKG.zip dist/$PKG.tar.gz
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: df-ai-53.16-r3-${{ github.run_number }}
+          path: |
+            dist/df-ai-53.16-r3.zip
+            dist/df-ai-53.16-r3.tar.gz
+          retention-days: 90
+          if-no-files-found: error
+
+  release:
+    name: Attach package to release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download package
+        uses: actions/download-artifact@v4
+        with:
+          name: df-ai-53.16-r3-${{ github.run_number }}
+          path: dist
+
+      - name: Create release with package
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/df-ai-53.16-r3.zip
+            dist/df-ai-53.16-r3.tar.gz
+          generate_release_notes: true
+          body: |
+            df-ai Lua port for **Dwarf Fortress 53.16 + DFHack 53.16-r3**.
+
+            **No compilation needed** — this is a pure-Lua plugin.
+
+            ### Install
+            1. Download and extract `df-ai-53.16-r3.zip` into your Dwarf
+               Fortress folder (the one containing `hack/`).
+            2. Start the game with DFHack.
+            3. In the DFHack terminal, run `enable df-ai`.
+
+            See `INSTALL.md` inside the archive for details.
