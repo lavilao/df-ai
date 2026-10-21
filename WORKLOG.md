@@ -80,3 +80,26 @@ Stage Summary:
 - Game flow: worldgen + world persistence WORKING; site screen blocked by tutorial modal
 - Next: grid-click tutorial popup dismissal, Embark button, setupdwarfgame Play Now, then df-ai fortress observation
 - All flow scripts in work/df-ai-port/flow*.sh; captures in captures/
+
+---
+Task ID: 4
+Agent: main (Z.ai)
+Task: Session 3 continued — full game-flow automation for df-ai integration testing
+
+Work Log:
+- Ran flow19 (definitive flow) multiple times with progressively hardened clicking.
+- SOLVED: reliable click pattern = xdotool windowfocus at boot + 2s hover-settle + click (first click after focus is eaten; retry same position).
+- SOLVED: worldgen-complete screen buttons via border-pixel analysis: [Play now!] = x 20-109, y 261-285 center (65,273); [Keep world] = x 123-437.
+- SOLVED: bottom tabs on unzoomed site screen: Find embark location (700-840,753), Reclaim (840-1060), Choose origin civ (1060-1260) — but these are HOVER substates.
+- SOLVED: Embark button on CLEAN zoomed view = x 840-950, y 735-795, center (895,765) — verified by crop-reading (f14_fail.png).
+- DISCOVERED: zoomed local view is INPUT-DEAD in this environment (Xvfb + xdotool XTest + SDL2/XI2): 81-position grid scans, slow clicks (4s holds), drags, gui.simulateInput fake clicks (_MOUSE_L_DOWN + _MOUSE_L), xdotool keys, all keys via simulateInput — ALL ignored after zoomed_in=true. Screen renders + Lua state fully readable/writable (zoomed_in, zoom_cent, location.embark_pos_min/max all settable), enabler receives lbut_down pulses, but button actions never fire.
+- Verified NOT the cause: overlay plugin (disabled, no change), site finder (not running), animation timers (0), help popups (closed), main_designation_doing_rectangles (cleared, no change), FPS (15 gfps, fine), window focus (windowfocus applied).
+- Tried: pushing df.viewscreen_setupdwarfgamest:new() via dfhack.screen.show() — screen pushes (focus: setupdwarfgame/Dwarves) but is a hollow shell (dwarf_info=0, points=0) — the real Embark button handler does game-state setup that can't be replicated from Lua.
+- Region_map Lua access: NOT [x][y] — flat pointer array ("Cannot read field region_map_entry.N") — needs flat-index fix (x*height+y or similar) for df-ai's embark site finder.
+- DF v50 title menu (1280x800 windowed): 6 buttons at y 381/442/478/514/550/586, x-center 632. (632,442) = Create new world (no world) / 2nd item.
+
+Stage Summary:
+- df-ai port itself: COMPLETE at module level (0 missing API refs, 11/11 modules load, compat resolvers work).
+- Integration test blocker: v50 embark screen input in headless Xvfb env — zoomed local view ignores ALL synthetic input (env limitation, not a df-ai issue).
+- Documented assets: 20+ flow scripts (flow*.sh, qc*.sh), screenshots in captures/, all UI coordinates mapped.
+- Next session options: (a) real XI2 event injection client (python-xlib), (b) pre-made fortress save hunt (DFFD/forums), (c) Xorg-dummy display server instead of Xvfb, (d) DFHack-native embark assistance via C++ plugin.
