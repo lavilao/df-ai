@@ -47,3 +47,36 @@ Work Log:
 
 Stage Summary:
 - Next: write df-ai/compat.lua (renames + runtime raw-subtype resolvers + modern manager-order creator), rewrite stocks.lua classify_item/queue_order, fix population/plan/trade call sites, re-run audit to 0 hard-missing, then world-gen + embark + full fortress integration test.
+
+---
+Task ID: 3
+Agent: main (Z.ai)
+Task: df-ai 53.16-r3 — module verification + full game-flow automation (worldgen→embark)
+
+Work Log:
+- Committed prior session's uncommitted work: compat.lua + API fixes (976a4cc), WORKLOG.md in repo (ff9fb93).
+- API audit re-run: 0 hard-missing of 207 refs (was 101). All 11 df-ai modules load cleanly in live DF 53.16-r3 (11 OK / 0 FAIL). compat.lua's 26 resolvers all execute; world-dependent refs resolve at title screen.
+- Fixed root-cause bugs in test harness:
+  * xwd -root does NOT composite child windows on Xvfb -> use xwd -id <DF window> (rendering was never broken!)
+  * xdotool needs LD_LIBRARY_PATH (local-libs) — all "dead clicks" in new scripts were silent libxdo.so load failures
+  * dfhack-run output carries ANSI escapes -> all focus-string pattern matches were failing (strip with sed)
+  * dfhack.gui.simulateInput DOES NOT EXIST in 53.16 -> use require('gui').simulateInput (Lua gui module)
+  * v50 screens ignore synthetic keyboard input + gps mouse injection gets clobbered by real X11 pointer poll
+  * DF v50 linux stores saves in XDG: ~/.local/share/Bay 12 Games/Dwarf Fortress/save/ (NOT data/save!)
+- Discovered DF CLI worldgen: ./dwarfort -gen <id> <seed> "POCKET ISLAND" (command line.txt); world persists to XDG saves.
+- Full UI flow automated via xdotool window-relative clicks (1280x800 forced via WINDOWED:YES+WINDOWEDX:1280):
+  * title "Create new world" = (632,442) [5-band layout; 6th band at y=381 when world exists]
+  * welcome popup Okay = (641,309)/(671,309) — MUST dismiss before anything else works on new_region
+  * new_region "Create world" = (846,753); params settable via Lua (simple_world_size=0 etc.)
+  * worldgen-complete: world_done check via world.world_data.world_width > 0
+  * choose_game_type: gametypes 0=DWARF_MAIN 1=ADVENTURE_MAIN 2=VIEW_LEGENDS; Fortress = (636,286)
+  * choose_start_site: location.region_pos valid (e.g. 11,51); embark_pos_min/max are ABS midmap coords (region*16+offset)
+  * region_map access in Lua is NOT [x][y] — flat pointer array ("Cannot read field region_map_entry.N" error) — needs flat indexing fix
+  * tutorial popup blocks site screen: box x 552-877 y 300-650 (top border magenta line y=297) — buttons TBD via grid-scan
+- Flow state: title→adopt→game_type→Fortress→site screen all working; stuck at tutorial popup dismissal + Embark button.
+
+Stage Summary:
+- Module-level port: COMPLETE (0 missing refs, 11/11 modules load)
+- Game flow: worldgen + world persistence WORKING; site screen blocked by tutorial modal
+- Next: grid-click tutorial popup dismissal, Embark button, setupdwarfgame Play Now, then df-ai fortress observation
+- All flow scripts in work/df-ai-port/flow*.sh; captures in captures/
