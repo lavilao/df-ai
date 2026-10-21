@@ -3,6 +3,8 @@
 local Population = {}
 Population.__index = Population
 
+local compat = dfhack.run_script_with_env(nil, 'df-ai/compat', {module = true})
+
 local LABOR_IMPORTANT = {
     [df.unit_labor.MINE] = true,
     [df.unit_labor.CARPENTER] = true,
@@ -176,7 +178,7 @@ function Population:update_citizenlist()
             new_pets[unit.id] = true
         elseif unit.relationship_ids then
             local r = unit.relationship_ids
-            if r[df.unit_relation_type.Owner] >= 0 then
+            if r[df.unit_relationship_type.PetOwner] >= 0 then
                 new_pets[unit.id] = true
             end
         end
@@ -358,27 +360,20 @@ end
 function Population:update_nobles()
     if not self.ai.config.manage_nobles then return end
 
-    local assignments = df.global.plotinfo.assignments
-    if not assignments then return end
+    -- v50+: position assignments live on the fortress entity
+    local fort = compat.fort_entity()
+    if not fort or not fort.assignments then return end
 
-    for _, assign in ipairs(assignments) do
-        if assign.position and assign.holder >= 0 then
-            local unit = df.unit.find(assign.holder)
-            if not unit then break end
-
-            -- Assign a bedroom to the noble
-            if self.ai.plan then
-                local room = self.ai.plan:getbedroom(assign.holder)
-                if room then
-                    self.noble_rooms[assign.holder] = room
-                end
-            end
-
-            -- Grant demands
-            if assign.demands then
-                for _, demand in ipairs(assign.demands) do
-                    if demand.needs_fulfillment then
-                        demand.needs_fulfillment = false
+    for _, assign in ipairs(fort.assignments) do
+        if assign.histfig >= 0 then
+            local histfig = df.historical_figure.find(assign.histfig)
+            local unit_id = histfig and histfig.unit_id or -1
+            if unit_id >= 0 then
+                -- Assign a bedroom to the noble
+                if self.ai.plan then
+                    local room = self.ai.plan:getbedroom(unit_id)
+                    if room then
+                        self.noble_rooms[unit_id] = room
                     end
                 end
             end
@@ -403,7 +398,7 @@ function Population:update_crimes()
     if not units then return end
 
     for _, unit in ipairs(units) do
-        if dfhack.units.isAlive(unit) and unit.civ_id == df.global.ui.civ_id then
+        if dfhack.units.isAlive(unit) and dfhack.units.isOwnCiv(unit) then
             if unit.flags1.prisoner then
                 -- Prisoners should be in jail
                 if self.ai.plan then
@@ -434,19 +429,19 @@ function Population:update_pets()
 
     for _, unit in ipairs(all) do
         if dfhack.units.isAlive(unit) and unit.relationship_ids then
-            local owner = unit.relationship_ids[df.unit_relation_type.Owner]
-            if owner < 0 then break end
+            local owner = unit.relationship_ids[df.unit_relationship_type.PetOwner]
+            if owner >= 0 then
+                -- Assign pets to pastures if available
+                local has_pasture = false
+                if self.ai.plan then
+                    local pasture = self.ai.plan:getpasture(unit.id)
+                    has_pasture = pasture ~= nil
+                end
 
-            -- Assign pets to pastures if available
-            local has_pasture = false
-            if self.ai.plan then
-                local pasture = self.ai.plan:getpasture(unit.id)
-                has_pasture = pasture ~= nil
-            end
-
-            -- Handle milking for grazers
-            if dfhack.units.isGrazer(unit) and has_pasture then
-                -- Milking is handled through zone assignment
+                -- Handle milking for grazers
+                if dfhack.units.isGrazer(unit) and has_pasture then
+                    -- Milking is handled through zone assignment
+                end
             end
         end
     end
@@ -471,34 +466,39 @@ function Population:update_locations()
     local world = df.global.world
     if not world then return end
 
-    -- Assign tavern keepers, librarians, priests
-    local units = world.units.all
-    if not units then return end
-
     local tavern_count = 0
     local library_count = 0
     local temple_count = 0
 
-    for _, unit in ipairs(units) do
-        if dfhack.units.isCitizen(unit, true) and dfhack.units.isAlive(unit) then
-            if unit.status.current_soul then
-                local soul = unit.status.current_soul
-                if soul.preferences then
-                    for _, pref in ipairs(soul.preferences) do
-                        if pref.type == df.unit_preference_type.LikeLocation then
-                            if pref.location_type == 'tavern' then
-                                tavern_count = tavern_count + 1
-                            elseif pref.location_type == 'library' then
-                                library_count = library_count + 1
-                            elseif pref.location_type == 'temple' then
-                                temple_count = temple_count + 1
-                            end
-                        end
-                    end
+    -- v50 removed location preferences entirely; count actual locations
+    -- from the fortress's abstract buildings instead.
+    local site = dfhack.world.getCurrentSite()
+    if site then
+        for _, loc in ipairs(site.buildings or {}) do
+            local ok, t = pcall(function()
+                if df.abstract_building_libraryst:is_instance(loc) then
+                    return 'library'
+                elseif df.abstract_building_inn_tavernst:is_instance(loc) then
+                    return 'tavern'
+                elseif df.abstract_building_templest:is_instance(loc) then
+                    return 'temple'
                 end
+                return nil
+            end)
+            if ok and t == 'tavern' then
+                tavern_count = tavern_count + 1
+            elseif ok and t == 'library' then
+                library_count = library_count + 1
+            elseif ok and t == 'temple' then
+                temple_count = temple_count + 1
             end
         end
     end
+    self.location_counts = {
+        tavern = tavern_count,
+        library = library_count,
+        temple = temple_count,
+    }
 end
 
 function Population:update_assignments()
@@ -590,23 +590,8 @@ end
 -- ============================================================
 
 function Population:update_jobs()
-    local world = df.global.world
-    if not world then return end
-    local jobs = world.jobs.list
-    if not jobs then return end
-    for _, job in ipairs(jobs) do
-        if job.job_type == df.job_type.CollectWeapons or
-           job.job_type == df.job_type.CollectArmor then
-            local ref = dfhack.job.getGeneralRef(job, df.general_ref_type.CONTAINED_IN_ITEM)
-            if ref then
-                local item = ref:getItem()
-                if item and item.flags.trader then
-                    dfhack.run_command('forceremove')
-                    break
-                end
-            end
-        end
-    end
+    -- v50 removed the CollectWeapons/CollectArmor jobs (military hauling was
+    -- reworked into squad equipment storage); nothing to watch here anymore.
 end
 
 -- ============================================================

@@ -212,7 +212,8 @@ function AI:tag_enemies()
     if not units then return end
 
     for _, unit in ipairs(units) do
-        if unit.civ_id ~= df.global.ui.civ_id and dfhack.units.isAlive(unit) then
+        -- v50: use DFHack's own-civ check (fort civ is not a simple field anymore)
+        if not dfhack.units.isOwnCiv(unit) and dfhack.units.isAlive(unit) then
             local pos = dfhack.units.getPosition(unit)
             if pos then
                 dfhack.run_command('tag ' .. unit.id)
@@ -352,6 +353,14 @@ local function handle_command(args)
         print('Unknown command: ' .. cmd)
         print('Available: version, status, report, abandon, enable <opt>, disable <opt>')
     end
+end
+
+-- Module mode: dfhack.reqscript / run_script_with_env(module=true) expect the
+-- module table back. Without this guard the script falls through to
+-- handle_command() and prints "df-ai is not running." at every boot
+-- (script-manager scans all scripts as modules at DFHack startup).
+if moduleMode then
+    return AI
 end
 
 if dfhack_flags and dfhack_flags.enable then
