@@ -131,6 +131,27 @@ testing focus — when you load a fortress you should see:
 digging. If you hit an error or a silent stop, please open an issue with
 the console output — the `WORKLOG.md` at the repo root tracks known issues.
 
+
+### Auto-embark behavior (r3.3)
+
+With `enable df-ai` active at the title screen:
+
+- **Fort save present** (default): df-ai selects "Continue Playing" and
+  loads your most recent fortress automatically. Set
+  `"embark_continue_fort": false` in `dfhack-config/df-ai.json` to always
+  start a NEW fortress instead.
+- **World present, no fort**: "Start Playing" → first world → Fortress.
+- **No saves at all**: "Create New World" → world generation runs
+  automatically → "Play now!" → Fortress.
+- The site screen runs a quick start (the game's own recommended site) or,
+  if that dialog is unavailable, our scored site selection (calm, non-evil,
+  vegetated, temperate land — the chosen tile's raw values are printed to
+  the console).
+- On the embark screen the last green **[Embark]** button may need one
+  manual click on some setups — the console tells you when. Once the map
+  loads, the AI takes over: `[df-ai] AI starting up` → templates → rooms →
+  digging.
+
 ### Why Lua? (for former C++ users)
 
 The original df-ai was a C++ DFHack plugin. DF v50+ removed/rewrote almost
