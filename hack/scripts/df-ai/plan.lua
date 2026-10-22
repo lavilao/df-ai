@@ -116,15 +116,15 @@ function Plan:update()
         return
     end
 
-    if self.bg_idx_generic == nil then
-        self.bg_idx_generic = 1
-        self:start_processing_generic()
-    end
-
-    if self.bg_idx_furniture == nil then
-        self.bg_idx_furniture = 1
-        self:start_processing_furniture()
-    end
+    -- r3.5: the task queues are processed HERE, from the update loop.
+    -- r3.4 registered dfhack.onStateChange handlers keyed on
+    -- SC_VIEWSCREEN_CHANGED — one task per viewscreen CHANGE. With the
+    -- fort running at rest no viewscreen ever changes, so the queues
+    -- never advanced a single task: rooms were placed, then nothing.
+    -- No dig designations, no constructions, no furnishing —
+    -- "the dwarves don't seem to do anything".
+    self:process_tasks_generic(2)
+    self:process_tasks_furniture(1)
 end
 
 function Plan:add_task(task_type, room, furniture, item_id)
@@ -875,151 +875,205 @@ function Plan:_dig_corridor_between(room_a, room_b)
 end
 
 -- ============================================================
--- Task processing (generic queue, one per frame)
+-- Task queue processing (r3.5)
+--
+-- r3.4 drove both queues from dfhack.onStateChange[SC_VIEWSCREEN_CHANGED]
+-- handlers — one task per viewscreen CHANGE. With the fort running at
+-- rest no viewscreen ever changes, so the queues never advanced: the
+-- plan placed its rooms and then sat there forever. No dig, no
+-- constructions, no furnishing, no manager-driven work.
+--
+-- The C++ original (plan_task.cpp) processes both queues from
+-- Plan::update, which the event manager calls every 240 ticks: when a
+-- queue is drained, the next update restarts it from the top, and a
+-- per-frame once-callback walks one task per frame until drained
+-- again. This port processes a bounded batch per Plan:update call
+-- (the AI wires plan updates every 25 ticks) with the same 240-tick
+-- restart cadence.
 -- ============================================================
 
-function Plan:start_processing_generic()
-    local self_ref = self
-    dfhack.onStateChange['df-ai-plan-bg'] = function(sc)
-        if sc == SC_VIEWSCREEN_CHANGED then
-            if self_ref.bg_idx_generic == nil then return end
-            if self_ref.bg_idx_generic > #self_ref.tasks_generic then
-                self_ref.bg_idx_generic = nil
+local TICKS_PER_YEAR = 12 * 28 * 24 * 50
+
+function Plan:_tick_now()
+    local y = df.global.cur_year or 0
+    local t = df.global.cur_year_tick or 0
+    return y * TICKS_PER_YEAR + t
+end
+
+-- Concurrent-dig cap (C++ wantdig_max: max(stock pick count, 2)).
+function Plan:_wantdig_max()
+    local n = 2
+    if self.ai and self.ai.stocks and self.ai.stocks.count_total then
+        local picks = self.ai.stocks.count_total['pick']
+        if picks and picks > n then n = picks end
+    end
+    return n
+end
+
+-- Execute ONE generic task. Returns (del, reason); del=true removes the
+-- task from the queue. check_rooms is NEVER deleted: it recurs on every
+-- queue restart, exactly like the C++ switch (checkrooms re-designates
+-- cancelled digs and advances room status each pass).
+function Plan:_run_generic_task(t)
+    local del = false
+    local reason = ''
+
+    if t.type == TASK_TYPE.want_dig then
+        local wantdig_max = self:_wantdig_max()
+        if t.room and t.room:is_dug() then
+            self:digroom(t.room)
+            del = true
+        else
+            local q = (t.room and t.room.queue) or 0
+            local nrd = self.nrdig[q] or 0
+            if nrd < wantdig_max then
+                self:digroom(t.room)
+                del = true
+            else
+                reason = 'dig queue ' .. q .. ' full (' .. nrd .. '/' .. wantdig_max .. ')'
+            end
+        end
+    elseif t.type == TASK_TYPE.dig_room or t.type == TASK_TYPE.dig_room_immediate then
+        if t.room then
+            -- Dig accesspath corridors first
+            if t.room.accesspath and #t.room.accesspath > 0 then
+                for _, ap_idx in ipairs(t.room.accesspath) do
+                    local ap_room = self.rooms[ap_idx + 1]
+                    if ap_room and ap_room.status == 'plan' then
+                        ap_room:dig()
+                    end
+                end
+            end
+
+            t.room:dig()
+            if t.room:is_dug() then
+                t.room.status = 'dug'
+                self:construct_room(t.room)
+                del = true
+            end
+        else
+            del = true
+        end
+    elseif t.type == TASK_TYPE.construct_workshop then
+        del = self:try_construct_workshop(t.room)
+    elseif t.type == TASK_TYPE.construct_furnace then
+        del = self:try_construct_furnace(t.room)
+    elseif t.type == TASK_TYPE.construct_stockpile then
+        del = self:try_construct_stockpile(t.room)
+    elseif t.type == TASK_TYPE.construct_farmplot then
+        del = self:try_construct_farmplot(t.room)
+    elseif t.type == TASK_TYPE.construct_activityzone then
+        del = self:try_construct_activityzone(t.room)
+    elseif t.type == TASK_TYPE.construct_tradedepot then
+        del = self:try_construct_tradedepot(t.room)
+    elseif t.type == TASK_TYPE.construct_windmill then
+        del = self:try_construct_windmill(t.room)
+    elseif t.type == TASK_TYPE.check_rooms then
+        self:checkrooms()
+    elseif t.type == TASK_TYPE.check_construct then
+        if t.room and t.room.bld_id >= 0 then
+            if not df.building.find(t.room.bld_id) then
+                t.room.bld_id = -1
+                self:construct_room(t.room)
+            end
+        end
+        del = true
+    elseif t.type == TASK_TYPE.check_furnish then
+        if t.room then
+            local any_furnish = false
+            for _, f in ipairs(t.room.layout) do
+                if f.bld_id < 0 and not f.ignore then
+                    self:add_task(TASK_TYPE.furnish, t.room, f)
+                    any_furnish = true
+                end
+            end
+            if not any_furnish and t.room.status == 'finished' then
+                t.room.furnished = true
+            end
+        end
+        del = true
+    elseif t.type == TASK_TYPE.check_idle then
+        del = true
+    elseif t.type == TASK_TYPE.furnish then
+        if t.room and t.furniture then
+            del = self:try_furnish(t.room, t.furniture)
+        else
+            del = true
+        end
+    else
+        -- task types without a ported handler (monitor_room_value,
+        -- monitor_cistern, setup_farmplot, rescue_caged, ...) must not
+        -- clog the queue forever.
+        del = true
+    end
+    return del, reason
+end
+
+function Plan:_run_furniture_task(t)
+    if t.type == TASK_TYPE.furnish then
+        if t.room and t.furniture then
+            return self:try_furnish(t.room, t.furniture), ''
+        end
+    end
+    return true, ''
+end
+
+-- Walk a task queue. `which` is 'generic' or 'furniture'. Processes at
+-- most `budget` tasks per call; a drained queue restarts from the top
+-- no more often than every 240 ticks (the C++ Plan::update cadence).
+function Plan:_process_queue(which, budget)
+    local tasks = which == 'generic' and self.tasks_generic or self.tasks_furniture
+    local idxfield = 'bg_idx_' .. which
+    local waitfield = 'queue_wait_' .. which
+    if self[idxfield] == nil or self[idxfield] < 1 then self[idxfield] = 1 end
+
+    local n = 0
+    while n < budget do
+        if self[idxfield] > #tasks then
+            -- drained: wait out the restart cadence, then begin a new pass
+            local now = self:_tick_now()
+            if self[waitfield] == nil then
+                self[waitfield] = now + 240
+            end
+            if now < self[waitfield] then
                 return
             end
-            local t = self_ref.tasks_generic[self_ref.bg_idx_generic]
-            if not t then
-                self_ref.bg_idx_generic = self_ref.bg_idx_generic + 1
-                return
-            end
+            self[waitfield] = nil
+            self[idxfield] = 1
+        end
 
-            local reason = ''
-            local del = false
-
-            -- one throwing task must not kill the background queue
-            local ok, err = pcall(function()
-            if t.type == TASK_TYPE.want_dig then
-                local wantdig_max = 2
-                if t.room and t.room:is_dug() then
-                    self_ref:digroom(t.room)
-                    del = true
-                else
-                    local q = (t.room and t.room.queue) or 0
-                    local nrd = self_ref.nrdig[q] or 0
-                    if nrd < wantdig_max then
-                        self_ref:digroom(t.room)
-                        del = true
-                    else
-                        reason = 'dig queue ' .. q .. ' full (' .. nrd .. '/' .. wantdig_max .. ')'
-                    end
-                end
-            elseif t.type == TASK_TYPE.dig_room or t.type == TASK_TYPE.dig_room_immediate then
-                if t.room then
-                    -- Dig accesspath corridors first
-                    if t.room.accesspath and #t.room.accesspath > 0 then
-                        for _, ap_idx in ipairs(t.room.accesspath) do
-                            local ap_room = self_ref.rooms[ap_idx + 1]
-                            if ap_room and ap_room.status == 'plan' then
-                                ap_room:dig()
-                            end
-                        end
-                    end
-
-                    t.room:dig()
-                    if t.room:is_dug() then
-                        t.room.status = 'dug'
-                        self_ref:construct_room(t.room)
-                        del = true
-                    end
-                else
-                    del = true
-                end
-            elseif t.type == TASK_TYPE.construct_workshop then
-                del = self_ref:try_construct_workshop(t.room)
-            elseif t.type == TASK_TYPE.construct_furnace then
-                del = self_ref:try_construct_furnace(t.room)
-            elseif t.type == TASK_TYPE.construct_stockpile then
-                del = self_ref:try_construct_stockpile(t.room)
-            elseif t.type == TASK_TYPE.construct_farmplot then
-                del = self_ref:try_construct_farmplot(t.room)
-            elseif t.type == TASK_TYPE.construct_activityzone then
-                del = self_ref:try_construct_activityzone(t.room)
-            elseif t.type == TASK_TYPE.construct_tradedepot then
-                del = self_ref:try_construct_tradedepot(t.room)
-            elseif t.type == TASK_TYPE.construct_windmill then
-                del = self_ref:try_construct_windmill(t.room)
-            elseif t.type == TASK_TYPE.check_rooms then
-                self_ref:checkrooms()
-            elseif t.type == TASK_TYPE.check_construct then
-                if t.room and t.room.bld_id >= 0 then
-                    if not df.building.find(t.room.bld_id) then
-                        t.room.bld_id = -1
-                        self_ref:construct_room(t.room)
-                    end
-                end
-                del = true
-            elseif t.type == TASK_TYPE.check_furnish then
-                if t.room then
-                    local any_furnish = false
-                    for _, f in ipairs(t.room.layout) do
-                        if f.bld_id < 0 and not f.ignore then
-                            self_ref:add_task(TASK_TYPE.furnish, t.room, f)
-                            any_furnish = true
-                        end
-                    end
-                    if not any_furnish and t.room.status == 'finished' then
-                        t.room.furnished = true
-                    end
-                end
-                del = true
-            elseif t.type == TASK_TYPE.check_idle then
-            elseif t.type == TASK_TYPE.furnish then
-                if t.room and t.furniture then
-                    del = self_ref:try_furnish(t.room, t.furniture)
-                else
-                    del = true
-                end
-            end
-            end)
-
+        local t = tasks[self[idxfield]]
+        if not t then
+            self[idxfield] = self[idxfield] + 1
+        else
+            local runner = which == 'generic'
+                and function(tt) return self:_run_generic_task(tt) end
+                or function(tt) return self:_run_furniture_task(tt) end
+            -- one throwing task must not kill the queue
+            local ok, del, reason = pcall(runner, t)
             if not ok then
-                dfhack.printerr('[df-ai] task "' .. tostring(t.type) .. '" failed: ' .. tostring(err))
+                dfhack.printerr('[df-ai] task "' .. tostring(t.type) .. '" failed: ' .. tostring(del))
                 del = true -- drop the broken task, keep the queue moving
+                reason = ''
             end
-
-            t.last_status = reason
-            self_ref.bg_idx_generic = self_ref.bg_idx_generic + 1
+            t.last_status = reason or ''
+            if del then
+                -- next task slides into this index; do NOT advance
+                table.remove(tasks, self[idxfield])
+            else
+                self[idxfield] = self[idxfield] + 1
+            end
+            n = n + 1
         end
     end
 end
 
-function Plan:start_processing_furniture()
-    local self_ref = self
-    dfhack.onStateChange['df-ai-furn-bg'] = function(sc)
-        if sc == SC_VIEWSCREEN_CHANGED then
-            if self_ref.bg_idx_furniture == nil then return end
-            if self_ref.bg_idx_furniture > #self_ref.tasks_furniture then
-                self_ref.bg_idx_furniture = nil
-                return
-            end
-            local t = self_ref.tasks_furniture[self_ref.bg_idx_furniture]
-            if not t then
-                self_ref.bg_idx_furniture = self_ref.bg_idx_furniture + 1
-                return
-            end
-            local ok, err = pcall(function()
-                if t.type == TASK_TYPE.furnish then
-                    if t.room and t.furniture then
-                        self_ref:try_furnish(t.room, t.furniture)
-                    end
-                end
-            end)
-            if not ok then
-                dfhack.printerr('[df-ai] furnish task failed: ' .. tostring(err))
-            end
-            self_ref.bg_idx_furniture = self_ref.bg_idx_furniture + 1
-        end
-    end
+function Plan:process_tasks_generic(budget)
+    self:_process_queue('generic', budget or 2)
+end
+
+function Plan:process_tasks_furniture(budget)
+    self:_process_queue('furniture', budget or 1)
 end
 
 -- ============================================================

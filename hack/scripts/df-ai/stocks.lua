@@ -332,12 +332,20 @@ end
 function Stocks:act(item_key, amount)
     if not amount or amount <= 0 then return end
 
-    -- Furniture categories resolved through the compat table
+    -- r3.5: compat.furniture is keyed by the df-ai furniture names in
+    -- UPPER case (BED, CHAIR, TRACTION_BENCH, ...). r3.4 looked them up
+    -- with the lowercase watch keys, so EVERY furniture category missed,
+    -- fell through to the else branch and just printed "Need more: ..."
+    -- over and over — the manager never received a single furniture
+    -- order (bed, door, table, coffin, ...). Uppercase the key here and
+    -- pass it on to queue_furniture -> compat.furniture_order.
     local furniture_key = item_key == 'food_storage' and 'BOX'
         or item_key == 'rope' and 'ROPE'
         or item_key
-    if compat.furniture[furniture_key] and compat.furniture[furniture_key].item_type ~= IT.TOOL then
-        self:queue_furniture(furniture_key, amount)
+    local fkey = furniture_key:upper()
+    local fdef = compat.furniture[fkey]
+    if fdef and fdef.item_type ~= IT.TOOL then
+        self:queue_furniture(fkey, amount)
         return
     end
 
@@ -364,6 +372,11 @@ function Stocks:act(item_key, amount)
     elseif item_key == 'drink' or item_key == 'meal' or item_key == 'food'
         or item_key == 'prepared_meal' or item_key == 'seeds' or item_key == 'plants' then
         self:queue_food_orders()
+    elseif item_key == 'block' then
+        -- r3.5: blocks were falling through to the "Need more" print;
+        -- masons can produce them (ConstructBlocks + item_type BLOCKS;
+        -- live enum: ConstructBlockS = 80, the singular form is nil).
+        self:queue_order(df.job_type.ConstructBlocks, IT.BLOCKS, -1, amount)
     elseif item_key == 'stepladder' or item_key == 'wheelbarrow' or item_key == 'nest_box'
         or item_key == 'hive' or item_key == 'screw' or item_key == 'jug' then
         -- Tool-based furniture
@@ -373,7 +386,14 @@ function Stocks:act(item_key, amount)
         or item_key:find('ammo_') == 1 then
         self:queue_military_orders(item_key, amount)
     else
-        dfhack.println('[df-ai] Need more: ' .. item_key .. ' (x' .. amount .. ')')
+        -- Categories with no producible manager order ("stone": boulders
+        -- only come from mining). r3.4 printed this on EVERY stocks update
+        -- (twice a second, forever); now only when the deficit changes.
+        self.last_need_print = self.last_need_print or {}
+        if self.last_need_print[item_key] ~= amount then
+            self.last_need_print[item_key] = amount
+            dfhack.println('[df-ai] Need more: ' .. item_key .. ' (x' .. amount .. ')')
+        end
     end
 end
 
@@ -498,6 +518,12 @@ function Stocks:pick_farm_plant()
     local plants = world.raws.plants.all
     if not plants then return -1 end
     local best, best_score = -1, -1
+    -- r3.5: farm plot plant ids are INDICES into raws.plants.all.
+    -- r3.4 assigned `plant.id` — the raw's STRING identifier — to `best`,
+    -- and the caller's `plant_id >= 0` then died with
+    -- "attempt to compare number with string" (stocks plants phase).
+    -- ipairs over a DFHack vector is 0-based, so `i` IS the plant index
+    -- (same convention as custom_workshop_index in plan.lua).
     for i, plant in ipairs(plants) do
         local ok_f, seed, spring, grass, tree, drink, mill, edible = pcall(function()
             local function flag(name)
@@ -515,7 +541,7 @@ function Stocks:pick_farm_plant()
             if edible then score = score + 1 end
             if score > best_score then
                 best_score = score
-                best = plant.id
+                best = i
             end
         end
     end

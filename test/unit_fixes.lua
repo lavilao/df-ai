@@ -185,6 +185,16 @@ dfhack_mock.units = {
         return u.pos.x, u.pos.y, u.pos.z
     end,
 }
+-- items API used by compat.subtype_by_id (raw subtype resolution);
+-- 0 subtypes -> resolver returns -1 (safe "no subtype" default).
+dfhack_mock.items = {
+    getSubtypeCount = function(item_type) return 0 end,
+    getSubtypeDef = function(item_type, i) return nil end,
+}
+dfhack_mock.matinfo = {
+    decode = function(item) return nil end,
+    find = function(token) return nil end,
+}
 dfhack_mock.run_script_with_env = function(env, name, opts)
     if opts and opts.module then
         local chunk, err = loadfile(SCRIPTS .. '/' .. name .. '.lua')
@@ -567,20 +577,30 @@ do
     check(ran.needs and ran.plants and ran.unforbid,
         'remaining phases still run after a phase crash')
 
-    -- pick_farm_plant: BitArray that THROWS on EDIBLE_RAW (the r3.3 crash)
+    -- pick_farm_plant: BitArray that THROWS on EDIBLE_RAW (the r3.3 crash).
+    -- r3.5: faithful plant_rawst — `.id` is the raw STRING identifier
+    -- (e.g. 'MUSHROOM_HELMET_PLUMP'); farm plot plant ids are the INDICES
+    -- into raws.plants.all. r3.4 returned `plant.id` (a string) and the
+    -- caller's `plant_id >= 0` died comparing number with string.
     local throwing_flags = setmetatable(
         { SEED = true, SPRING = true, GRASS = false, TREE = false, DRINK = true, MILL = false },
         { __index = function() error('Cannot read field BitArray<>.EDIBLE_RAW: not found.') end })
     df_mock.global.world = {
         raws = { plants = { all = dfvec({
-            { id = 42, flags = throwing_flags },
-            { id = 43, flags = { SEED = false, SPRING = true } },
+            { id = 'MUSHROOM_HELMET_PLUMP', flags = throwing_flags },
+            { id = 'CAVE_BLOOM', flags = { SEED = false, SPRING = true } },
         }) } },
     }
     local ok_pfp, plant_id = pcall(function() return s:pick_farm_plant() end)
     check(ok_pfp, 'pick_farm_plant survives the removed EDIBLE_RAW enum member')
-    check(ok_pfp and plant_id == 42,
-        'drink plant still chosen (id 42), got ' .. tostring(plant_id))
+    check(ok_pfp and type(plant_id) == 'number',
+        'pick_farm_plant returns a NUMBER (vector index), got ' .. tostring(plant_id))
+    check(ok_pfp and plant_id == 0,
+        'drink plant chosen by index 0 (ipairs over a DFHack vector is 0-based), got ' .. tostring(plant_id))
+    -- the caller comparison that crashed the r3.4 log must be a pure
+    -- number comparison now
+    local ok_cmp = pcall(function() return plant_id >= 0 end)
+    check(ok_cmp and ok_cmp, 'plant_id >= 0 no longer throws (was: compare number with string)')
 end
 
 -- ============================================================
@@ -677,6 +697,181 @@ do
         'noble bedrooms assigned via flattened assignments (units 105, 107)')
 
     df_mock.global.plotinfo = saved_plotinfo
+end
+
+-- ============================================================
+-- 9. r3.5: distance_to with plain coords, update-driven task queues,
+--    stocks act() furniture routing + rate-limited prints
+-- ============================================================
+print('--- r3.5: room distance_to (corridor connection crash) ---')
+do
+    local ok_rm, rooms_mod = pcall(dfhack_mock.run_script_with_env, nil, 'df-ai/rooms', { module = true })
+    check(ok_rm, 'rooms module loads')
+
+    local r = rooms_mod.room.new('bedroom', { x = 10, y = 10, z = 5 }, { x = 12, y = 12, z = 5 })
+    -- center (11, 11, 5)
+    check(r:distance_to({ x = 11, y = 14, z = 5 }) == 3,
+        'distance_to accepts a PLAIN {x,y,z} table (r3.4 called other:pos() on it)')
+    check(r:distance_to(r) == 0, 'distance_to still accepts room objects (self)')
+    local r2 = rooms_mod.room.new('corridor', { x = 10, y = 20, z = 5 }, { x = 12, y = 20, z = 5 })
+    check(r:distance_to(r2) == 9, 'distance_to between two room objects (centers 11,11 -> 11,20)')
+    check(r:distance_to(nil) == math.huge, 'distance_to(nil) -> math.huge, no crash')
+    check(r:distance_to({ x = 1 }) == math.huge, 'distance_to(partial table) -> math.huge, no crash')
+end
+
+print('--- r3.5: task queues run from update (idle-dwarf root cause) ---')
+do
+    local ok_pl, Plan = pcall(dfhack_mock.run_script_with_env, nil, 'df-ai/plan', { module = true })
+    check(ok_pl, 'plan module loads')
+    local ok_rm2, rooms_mod = pcall(dfhack_mock.run_script_with_env, nil, 'df-ai/rooms', { module = true })
+    check(ok_rm2, 'rooms module loads (task types)')
+
+    df_mock.global.cur_year = 251
+    df_mock.global.cur_year_tick = 0
+
+    local p = Plan.new({})
+    p.setup_done = true -- skip the setup path; queues only run post-setup
+
+    -- a bedroom with no map interaction (is_dug true = fresh surface room,
+    -- exactly what the user's fort had: no designations yet)
+    local r = rooms_mod.room.new('bedroom', { x = 10, y = 10, z = 5 }, { x = 12, y = 12, z = 5 })
+    r.is_dug = function() return true end
+    r.dig = function() end
+
+    p:add_task(rooms_mod.TASK_TYPE.check_rooms)
+    p:add_task(rooms_mod.TASK_TYPE.want_dig, r)
+
+    -- NO viewscreen change ever happens — r3.4 needed one per task
+    p:update()
+    check(dfhack_mock.onStateChange['df-ai-plan-bg'] == nil
+        and dfhack_mock.onStateChange['df-ai-furn-bg'] == nil,
+        'no plan/furnish onStateChange handlers registered (r3.4 drove the queues from them)')
+    check(p.bg_idx_generic ~= nil and p.bg_idx_generic >= 2,
+        'queue advanced past task 1 WITHOUT any viewscreen change')
+    check(#p.tasks_generic >= 2,
+        'want_dig converted: dig_room queued (' .. #p.tasks_generic .. ' tasks)')
+
+    -- drain the queue
+    for _ = 1, 8 do p:update() end
+    local only_check_rooms = true
+    for _, t in ipairs(p.tasks_generic) do
+        if t.type ~= 'check_rooms' then only_check_rooms = false end
+    end
+    check(only_check_rooms,
+        'all dig/construct tasks completed; only recurring check_rooms remains')
+    check(r.status == 'dug', 'room advanced to dug (dig->construct chain fired)')
+    check(p.bg_idx_generic > #p.tasks_generic,
+        'queue drained; restart gated at 240 ticks')
+
+    -- drain gate: before 240 ticks pass, nothing restarts
+    df_mock.global.cur_year_tick = 100
+    p:update()
+    check(p.bg_idx_generic > #p.tasks_generic and p.queue_wait_generic ~= nil,
+        'drained queue waits out the 240-tick cadence (tick 100 < 240)')
+
+    -- after the cadence: a new pass begins, check_rooms runs AGAIN
+    df_mock.global.cur_year_tick = 300
+    local ran_again = 0
+    local old_checkrooms = p.checkrooms
+    p.checkrooms = function(self2) ran_again = ran_again + 1 old_checkrooms(self2) end
+    p:update()
+    p.checkrooms = old_checkrooms
+    check(ran_again >= 1 and p.bg_idx_generic == 2,
+        'new pass started after 240 ticks; check_rooms recurs (never deleted)')
+
+    -- wantdig_max follows stock picks (C++ parity)
+    check(p:_wantdig_max() == 2, 'wantdig_max defaults to 2 with no stocks')
+    p.ai = { stocks = { count_total = { pick = 5 } } }
+    check(p:_wantdig_max() == 5, 'wantdig_max = max(stock picks, 2) -> 5')
+
+    -- a throwing task must not wedge the queue (r3.4 semantics kept)
+    local p2 = Plan.new({}); p2.setup_done = true
+    local boom_room = { queue = 0, is_dug = function() error('task boom') end }
+    p2.tasks_generic = {
+        { type = 'want_dig', room = boom_room },
+        { type = 'check_idle' },
+    }
+    p2.bg_idx_generic = 1
+    df_mock.global.cur_year_tick = 1000
+    local err_seen = {}
+    local old_perr = dfhack_mock.printerr
+    dfhack_mock.printerr = function(msg) err_seen[#err_seen + 1] = tostring(msg) end
+    local ok_proc = pcall(function() p2:process_tasks_generic(4) end)
+    check(ok_proc, 'processing a throwing task does not propagate')
+    dfhack_mock.printerr = old_perr
+    check(#err_seen >= 1 and err_seen[1]:find('task boom', 1, true),
+        'the throwing task was reported, not swallowed')
+    check(#p2.tasks_generic == 0,
+        'broken task dropped, queue kept moving (0 tasks left)')
+end
+
+print('--- r3.5: stocks act() furniture routing + print rate limit ---')
+do
+    df_mock.global.cur_year = 251
+    local ok_st2, Stocks = pcall(dfhack_mock.run_script_with_env, nil, 'df-ai/stocks', { module = true })
+    check(ok_st2, 'stocks module loads (act routing)')
+    local s2 = Stocks.new({})
+
+    local furniture_calls, order_calls = {}, {}
+    s2.queue_furniture = function(self, name, amount)
+        furniture_calls[#furniture_calls + 1] = { name = name, amount = amount }
+        return true
+    end
+    s2.queue_order = function(self, jt, it, sub, amount)
+        order_calls[#order_calls + 1] = { jt = jt, it = it, sub = sub, amount = amount }
+        return true
+    end
+
+    -- the exact keys that spammed "Need more" in the user's log
+    s2:act('bed', 20)
+    s2:act('door', 20)
+    s2:act('coffin', 10)
+    s2:act('quern', 5)
+    s2:act('traction_bench', 5)
+    local routed = {}
+    for _, c in ipairs(furniture_calls) do routed[c.name] = (routed[c.name] or 0) + 1 end
+    check(routed['BED'] and routed['DOOR'] and routed['COFFIN']
+        and routed['QUERN'] and routed['TRACTION_BENCH'],
+        'furniture needs routed to queue_furniture with UPPER-case keys')
+
+    s2:act('block', 20)
+    local block_ok = false
+    for _, c in ipairs(order_calls) do
+        if c.jt == df.job_type.ConstructBlocks and c.it == df.item_type.BLOCKS then
+            block_ok = true
+        end
+    end
+    check(block_ok, 'block need now queues ConstructBlock (was a dead print)')
+
+    -- stepladder still goes the MakeTool route (TOOL-typed compat entry)
+    order_calls = {}
+    s2:act('stepladder', 3)
+    local tool_ok = false
+    for _, c in ipairs(order_calls) do
+        if c.jt == df.job_type.MakeTool then tool_ok = true end
+    end
+    check(tool_ok, 'tool-based furniture still routed via MakeTool')
+
+    -- residual categories: informational print ONCE per changed amount
+    local printed = {}
+    local old_println = dfhack_mock.println
+    dfhack_mock.println = function(msg) printed[#printed + 1] = tostring(msg) end
+    s2:act('stone', 20)
+    s2:act('stone', 20)
+    s2:act('stone', 20)
+    local stone_prints = 0
+    for _, m in ipairs(printed) do
+        if m:find('stone', 1, true) then stone_prints = stone_prints + 1 end
+    end
+    check(stone_prints == 1,
+        'unorderable "stone" prints ONCE per amount (was every stocks update), got ' .. stone_prints)
+    s2:act('stone', 60)
+    local stone_prints2 = 0
+    for _, m in ipairs(printed) do
+        if m:find('stone', 1, true) then stone_prints2 = stone_prints2 + 1 end
+    end
+    check(stone_prints2 == 2, 'changed deficit prints again (once more)')
+    dfhack_mock.println = old_println
 end
 
 -- ============================================================

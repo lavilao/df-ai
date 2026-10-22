@@ -363,8 +363,24 @@ function room:compute_value()
 end
 
 function room:distance_to(other)
+    -- r3.5: `other` may be a room object OR a plain {x,y,z} coord table —
+    -- plan.lua passes find_fort_entrance()'s result (a plain table) here,
+    -- and with the old `other:pos()` call that crashed with
+    -- "attempt to call a nil value (method 'pos')", which aborted the
+    -- whole corridor-connection pass in plan_setup.
     local p1 = self:pos()
-    local p2 = other:pos()
+    local p2 = nil
+    if type(other) == 'table' then
+        if type(other.pos) == 'function' then
+            local ok, p = pcall(other.pos, other)
+            p2 = (ok and type(p) == 'table') and p or other
+        else
+            p2 = other
+        end
+    end
+    if not p2 or p2.x == nil or p2.y == nil or p2.z == nil then
+        return math.huge
+    end
     return math.abs(p1.x - p2.x) + math.abs(p1.y - p2.y) + math.abs(p1.z - p2.z) * 10
 end
 
