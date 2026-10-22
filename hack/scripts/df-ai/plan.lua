@@ -138,9 +138,21 @@ function Plan:load_blueprint()
     self.templates = {}
     self.plan_config = nil
 
-    local ok, plan = pcall(json.decode_file, 'df-ai-blueprints/plans/generic01.json')
-    if not ok or not plan then
-        dfhack.println('[df-ai] Failed to load plan: ' .. tostring(plan))
+    local plan = nil
+    -- release layout, nested-zip layout, repo checkout layout
+    for _, path in ipairs({
+        'df-ai-blueprints/plans/generic01.json',
+        'df-ai-53.16-r3/df-ai-blueprints/plans/generic01.json',
+        'plans/generic01.json',
+    }) do
+        local ok_p, p = pcall(json.decode_file, path)
+        if ok_p and p then
+            plan = p
+            break
+        end
+    end
+    if not plan then
+        dfhack.println('[df-ai] Failed to load plan: make sure the df-ai-blueprints/ folder is inside your Dwarf Fortress directory.')
         return
     end
     self.plan_config = plan
@@ -161,14 +173,17 @@ function Plan:load_blueprint()
     }
 
     for _, base in ipairs(template_bases) do
-        -- Two supported layouts, tried in order:
+        -- Three supported layouts, tried in order:
         --   1. Release package: df-ai-blueprints/templates/<base>/
-        --   2. Repo checkout:    df-ai-blueprints/rooms/templates/<base>/
+        --   2. Release zip extracted without merging the top folder:
+        --      df-ai-53.16-r3/df-ai-blueprints/templates/<base>/
+        --   3. Repo checkout:    df-ai-blueprints/rooms/templates/<base>/
         -- NOTE: dfhack.filesystem.listdir on a missing dir does NOT error —
         -- it returns nil. Always type-check the result.
         local loaded_any = false
         for _, dir in ipairs({
             'df-ai-blueprints/templates/' .. base .. '/',
+            'df-ai-53.16-r3/df-ai-blueprints/templates/' .. base .. '/',
             'df-ai-blueprints/rooms/templates/' .. base .. '/',
         }) do
             local ok_list, result = pcall(dfhack.filesystem.listdir, dir)

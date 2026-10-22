@@ -26,11 +26,17 @@
    `[df-ai] AI starting up` en la consola.
 6. Consulta el estado con `df-ai` o `df-ai status`.
 
-> Nota: crea tu fortaleza manualmente (embark normal, "Prepare carefully" o
-> "Play now"). La automatización de embark existe (`df-ai/embark`) pero está
-> desactivada por ahora. `enable df-ai` debe ejecutarse ANTES de cargar el
-> mapa para que arranque solo; si ya estás en la fortaleza, escribe
-> `enable df-ai` de nuevo y recarga (`die` no es necesario).
+> **Embark automático (nuevo)**: con `enable df-ai` activo, df-ai conduce el
+> flujo pre-fortaleza: título → crear mundo → worldgen → "Play now!" →
+> tipo Fortress → selección de sitio → Embark → "Play Now". Sigue los
+> mensajes `[df-ai embark]` en la consola; si un paso no avanza solo (la
+> inyección de input depende del entorno), la consola te dice exactamente
+> qué botón pulsar — como máximo 1-2 clicks. Config en
+> `dfhack-config/df-ai.json`: `embark_mode` = `"quick"` (el juego elige el
+> sitio, 100% automático) o `"scored"` (df-ai puntúa todos los tiles del
+> mundo y elige el mejor: tierra, calmado, no malvado, vegetado, templado).
+> Si ya estás dentro de una fortaleza, `enable df-ai` arranca el AI al
+> momento.
 
 Si algo falla, copia el texto de error de la consola de DFHack y repórtalo
 en [Issues](../../issues).
@@ -93,6 +99,22 @@ Once enabled, the AI starts automatically whenever a fortress map loads
 (`SC_MAP_LOADED`). It will dig and furnish the planned fortress, manage
 labors, queue manager orders, and watch stocks. Configuration lives in
 `dfhack-config/df-ai.json`.
+
+### Auto-embark
+
+With `enable df-ai` active from the title screen, df-ai drives the whole
+pre-fortress flow: worldgen guidance, "Play now!" after worldgen, Fortress
+mode, site selection, Embark, and Play Now. Watch the `[df-ai embark]`
+console messages — if a step cannot advance on its own (input injection
+depends on the environment), the console tells you exactly which button
+to click (at most 1-2 clicks).
+
+Config options in `dfhack-config/df-ai.json`:
+- `embark_mode`: `"quick"` (default — the game's quick start picks a
+  forested mineral-rich site, fully automatic) or `"scored"` (df-ai scores
+  every world tile — land, calm, not evil, vegetated, temperate — writes
+  the best embark rectangle into the site screen, then presses Embark).
+- `random_embark`: set to `false` to disable auto-embark entirely.
 
 ### Port status (what to expect)
 

@@ -28,6 +28,7 @@ end
 local function default_config()
     return {
         random_embark = true,
+        embark_mode = 'quick',
         random_embark_world = '',
         write_console = true,
         write_log = true,
@@ -71,6 +72,15 @@ end
 
 function AI:init()
     self.config = load_config()
+    -- merge defaults for any missing keys. Without this, a missing or
+    -- empty config file (json encodes an empty table as []) leaves the
+    -- AI with NO config at all — random_embark etc. silently nil.
+    local defaults = default_config()
+    for k, v in pairs(defaults) do
+        if self.config[k] == nil then
+            self.config[k] = v
+        end
+    end
     save_config(self.config)
     self:load_modules()
 end
@@ -118,9 +128,18 @@ end
 
 function AI:startup()
     debug_log('AI starting up')
-    self:load_modules()
+    -- only (re)load modules if missing — startup can run after init()
+    -- already created them, and re-loading would discard module state
+    if not self.plan or not self.population then
+        self:load_modules()
+    end
     if self.population then self.population:startup() end
-    if self.plan then self.plan:startup() end
+    if self.plan then
+        self.plan:startup()
+        -- kick the first plan update immediately so digging starts ASAP
+        local ok, err = pcall(function() self.plan:update() end)
+        if not ok then debug_log('first plan update failed: ' .. tostring(err)) end
+    end
     if self.stocks then self.stocks:startup() end
     if self.camera then self.camera:startup() end
     self:register_repeating_tasks()
@@ -134,7 +153,37 @@ function AI:shutdown()
     repeatutil.cancel(GLOBAL_KEY .. '-pop-deathwatch')
     repeatutil.cancel(GLOBAL_KEY .. '-stocks')
     repeatutil.cancel(GLOBAL_KEY .. '-camera')
+    repeatutil.cancel(GLOBAL_KEY .. '-embark')
     self:clear()
+    -- if still enabled, re-arm the auto-embark watcher so the
+    -- abandon -> new fortress cycle keeps working
+    if ai_enabled and self.config and self.config.random_embark then
+        self:arm_embark_watch()
+    end
+end
+
+-- Auto-embark watcher: polls the pre-fortress screens while no map is
+-- loaded. Must be armed at enable time (NOT at map load) because worldgen
+-- completes without a viewscreen change.
+-- NOTE: repeat-util 'ticks' timers do NOT run without a loaded map, so
+-- this uses a self-re-arming frame-based dfhack.timeout instead (frames
+-- render at the title screen and during worldgen).
+function AI:arm_embark_watch()
+    local function poll()
+        if not ai_enabled or dfhack.isMapLoaded() then
+            return -- stop polling; the map-load flow takes over
+        end
+        local ok, err = pcall(function()
+            if the_ai and the_ai.embark then
+                the_ai.embark:on_viewscreen()
+            end
+        end)
+        if not ok then
+            dfhack.printerr('[df-ai] embark watcher: ' .. tostring(err))
+        end
+        dfhack.timeout(30, 'frames', poll) -- ~0.5s at 60 fps
+    end
+    dfhack.timeout(5, 'frames', poll)
 end
 
 function AI:clear()
@@ -177,8 +226,10 @@ function AI:register_repeating_tasks()
 end
 
 function AI:unpause()
+    -- direct state write — the old "multicmd resume; resume" commands
+    -- no longer exist in DFHack 50+
     if df.global.pause_state then
-        dfhack.run_command('multicmd resume; resume')
+        df.global.pause_state = false
     end
 end
 
@@ -216,8 +267,8 @@ function AI:tag_enemies()
         if not dfhack.units.isOwnCiv(unit) and dfhack.units.isAlive(unit) then
             local pos = dfhack.units.getPosition(unit)
             if pos then
-                dfhack.run_command('tag ' .. unit.id)
-                -- Follow hostile if camera is enabled
+                -- Follow hostiles if camera is enabled (old df-ai "tagged"
+                -- units internally; the 53.16 port tracks them via camera)
                 if self.camera and self.camera.enabled then
                     self.camera:follow_unit(unit.id)
                 end
@@ -291,18 +342,38 @@ function AI:find_room_at(c)
     return nil
 end
 
-local the_ai = nil
+-- ============================================================
+-- Persistent state
+-- ============================================================
+-- IMPORTANT: `the_ai` and `ai_enabled` are intentionally GLOBALS
+-- (no `local`!). DFHack caches each script's environment table and
+-- reuses it across invocations, so globals survive from one run of
+-- this script to the next — locals do not.
+--
+-- Why this matters: on SC_WORLD_LOADED, DFHack's script-manager
+-- re-runs EVERY script in module mode (reqscript scan). That
+-- re-execution used to re-register dfhack.onStateChange['df-ai']
+-- with a closure over a fresh (nil) local `the_ai`, clobbering the
+-- real instance created by `enable df-ai` — so the AI silently
+-- never started at map load. With env globals, every incarnation of
+-- the callback sees the same, persistent state.
 
-dfhack.onStateChange[GLOBAL_KEY] = function(sc)
-    if sc == SC_MAP_LOADED then
-        if the_ai then
-            the_ai:startup()
-        end
-    elseif sc == SC_MAP_UNLOADED then
-        if the_ai then
-            the_ai:shutdown()
-        end
+-- keep prior values if this env already ran the script before
+the_ai = the_ai or nil
+ai_enabled = ai_enabled or false
+
+-- Modern DFHack enable API: lets `enable`/`disable`, the control
+-- panel and `script-manager` track our state.
+function isEnabled()
+    return ai_enabled
+end
+
+local function safe(fn, what)
+    local ok, err = pcall(fn)
+    if not ok then
+        dfhack.printerr('[df-ai] ' .. what .. ' failed: ' .. tostring(err))
     end
+    return ok
 end
 
 local function print_status()
@@ -329,6 +400,13 @@ local function handle_command(args)
         print_version()
     elseif cmd == 'status' then
         print_status()
+    elseif cmd == 'embark' then
+        -- manual trigger for the auto-embark flow
+        if the_ai and the_ai.embark then
+            safe(function() the_ai.embark:on_viewscreen(true) end, 'embark')
+        else
+            print('df-ai is not running (enable it first).')
+        end
     elseif cmd == 'report' then
         if the_ai then
             local report = the_ai:report()
@@ -351,7 +429,39 @@ local function handle_command(args)
         print('df-ai option disabled: ' .. sub)
     else
         print('Unknown command: ' .. cmd)
-        print('Available: version, status, report, abandon, enable <opt>, disable <opt>')
+        print('Available: version, status, report, abandon, embark, enable <opt>, disable <opt>')
+    end
+end
+
+-- ============================================================
+-- State-change hook (re-registered on every run of this script;
+-- idempotent because all state lives in the persistent env above)
+-- ============================================================
+
+dfhack.onStateChange[GLOBAL_KEY] = function(sc)
+    if sc == SC_MAP_LOADED then
+        if ai_enabled then
+            safe(function()
+                if not the_ai then
+                    the_ai = AI:new()
+                    the_ai:init()
+                end
+                the_ai:startup()
+            end, 'startup')
+        end
+    elseif sc == SC_MAP_UNLOADED then
+        if the_ai then
+            safe(function() the_ai:shutdown() end, 'shutdown')
+        end
+    elseif sc == SC_VIEWSCREEN_CHANGED then
+        -- auto-embark watcher (pre-fortress screens only)
+        if ai_enabled and the_ai and not dfhack.isMapLoaded() then
+            safe(function()
+                if the_ai.embark and the_ai.embark.on_viewscreen then
+                    the_ai.embark:on_viewscreen()
+                end
+            end, 'embark watcher')
+        end
     end
 end
 
@@ -365,21 +475,29 @@ end
 
 if dfhack_flags and dfhack_flags.enable then
     if dfhack_flags.enable_state then
-        if not the_ai then
-            the_ai = AI:new()
-            the_ai:init()
-        end
-        the_ai.enabled = true
-        local ok, site = pcall(dfhack.world.getCurrentSite)
-        if ok and site then
-            the_ai:startup()
-        end
-        print('df-ai enabled')
+        ai_enabled = true
+        safe(function()
+            if not the_ai then
+                the_ai = AI:new()
+                the_ai:init()
+            end
+            -- if a fortress map is already loaded, start right away;
+            -- otherwise arm the auto-embark watcher for the title flow
+            if dfhack.isMapLoaded() then
+                the_ai:startup()
+            else
+                the_ai:arm_embark_watch()
+            end
+        end, 'enable')
+        print('df-ai enabled' ..
+            (the_ai and the_ai.config and the_ai.config.random_embark
+                and ' (auto-embark on)' or ''))
     else
+        ai_enabled = false
         if the_ai then
-            the_ai:shutdown()
-            the_ai = nil
+            safe(function() the_ai:shutdown() end, 'shutdown')
         end
+        the_ai = nil
         print('df-ai disabled')
     end
     return
