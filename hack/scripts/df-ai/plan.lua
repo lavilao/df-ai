@@ -86,6 +86,31 @@ function Plan:startup()
         self.past_initial_phase = false
         self.should_search_for_metal = true
         self.setup_done = true
+        -- r3.6: log what was placed, so the first console lines describe
+        -- the whole fort layout (one line per room type)
+        local by_type = {}
+        for _, r in ipairs(self.rooms) do
+            local key = r.type
+            if r.workshop_type ~= nil then
+                local ok, name = pcall(function()
+                    local wt = df.workshop_type
+                    for v = wt._first_item or 0, wt._last_item or 999 do
+                        if v == r.workshop_type then return wt[v] end
+                    end
+                end)
+                if ok and name then key = key .. '/' .. name end
+            elseif r.stockpile_type then
+                key = key .. '/' .. tostring(r.stockpile_type)
+            end
+            by_type[key] = (by_type[key] or 0) + 1
+        end
+        local summary = {}
+        for k, n in pairs(by_type) do
+            table.insert(summary, n .. 'x ' .. k)
+        end
+        table.sort(summary)
+        self:_log('layout: ' .. table.concat(summary, ', '))
+        self:_log('digging starts now: 2 concurrent rooms, bounded by pick count')
     else
         -- setup_done stays false: Plan:update retries (blocks may not be
         -- loaded yet on the very first ticks after embark)
@@ -894,6 +919,55 @@ end
 
 local TICKS_PER_YEAR = 12 * 28 * 24 * 50
 
+-- ============================================================
+-- Logging (r3.6): every phase of the plan pipeline reports to the
+-- console so a stuck fort is diagnosable from the log alone.
+-- - one-time events log immediately
+-- - recurring "waiting" reasons are throttled per task (once / 1200
+--   ticks) so the log stays readable
+-- ============================================================
+
+local function describe_room(r)
+    if not r then return '<nil>' end
+    local t = tostring(r.type)
+    if r.workshop_type ~= nil then
+        local ok, name = pcall(function()
+            local wt = df.workshop_type
+            for v = wt._first_item or 0, wt._last_item or 999 do
+                if v == r.workshop_type then return wt[v] end
+            end
+        end)
+        if ok and name then t = t .. '/' .. name end
+    elseif r.stockpile_type then
+        t = t .. '/' .. tostring(r.stockpile_type)
+    elseif r.corridor_type then
+        t = t .. '/' .. tostring(r.corridor_type)
+    end
+    return t .. ' ' .. tostring(r.min.x) .. ',' .. tostring(r.min.y) .. ','
+        .. tostring(r.min.z) .. ' q' .. tostring(r.queue)
+end
+
+function Plan:_log(msg)
+    dfhack.println('[df-ai:plan] ' .. msg)
+end
+
+function Plan:_log_task(t, msg)
+    -- throttle recurring per-task messages
+    t._last_log = t._last_log or {}
+    local now = self:_tick_now()
+    if t._last_log[msg] and (now - t._last_log[msg]) < 1200 then
+        return
+    end
+    t._last_log[msg] = now
+    self:_log('task ' .. tostring(t.type) .. ' [' .. describe_room(t.room) .. ']: ' .. msg)
+end
+
+local function task_log_once(self, t, msg)
+    if t._logged_once == nil then t._logged_once = {} end
+    if t._logged_once[msg] then return end
+    t._logged_once[msg] = true
+    self:_log('task ' .. tostring(t.type) .. ' [' .. describe_room(t.room) .. ']: ' .. msg)
+end
 function Plan:_tick_now()
     local y = df.global.cur_year or 0
     local t = df.global.cur_year_tick or 0
@@ -920,7 +994,16 @@ function Plan:_run_generic_task(t)
 
     if t.type == TASK_TYPE.want_dig then
         local wantdig_max = self:_wantdig_max()
-        if t.room and t.room:is_dug() then
+        local any_immediate = false
+        for _, tt in ipairs(self.tasks_generic) do
+            if tt.type == TASK_TYPE.dig_room_immediate then
+                any_immediate = true
+                break
+            end
+        end
+        if any_immediate then
+            reason = 'waiting for more important room to be dug'
+        elseif (t.room and t.room:is_dug()) or t.room == nil then
             self:digroom(t.room)
             del = true
         else
@@ -945,29 +1028,56 @@ function Plan:_run_generic_task(t)
                 end
             end
 
-            t.room:dig()
-            if t.room:is_dug() then
+            -- C++ order: check is_dug FIRST, then (re-)designate. The
+            -- old port designated first, so a freshly-designated room
+            -- always looked "not dug" on the same pass.
+            local dug, why = t.room:is_dug()
+            if dug then
                 t.room.status = 'dug'
+                self:_log('room DUG: ' .. describe_room(t.room))
                 self:construct_room(t.room)
                 del = true
+            else
+                local designated, cleared = t.room:dig()
+                if designated > 0 then
+                    task_log_once(self, t, 'designated ' .. designated
+                        .. ' tiles for digging' .. (cleared > 0
+                            and (' (cleared ' .. cleared .. ' stale designations)')
+                            or ''))
+                end
+                local remaining = t.room:dig_remaining()
+                reason = why or ('still ' .. remaining .. ' tiles of rock')
+                -- If nothing is designated and nothing remains but is_dug
+                -- said false, something is off: log it loudly ONCE.
+                if designated == 0 and remaining == 0 then
+                    task_log_once(self, t, 'no diggable tiles and no walls left — '
+                        .. 'waiting for miners (reason: ' .. tostring(why) .. ')')
+                end
             end
         else
             del = true
         end
     elseif t.type == TASK_TYPE.construct_workshop then
         del = self:try_construct_workshop(t.room)
+        if not del then reason = 'workshop construction not ready' end
     elseif t.type == TASK_TYPE.construct_furnace then
         del = self:try_construct_furnace(t.room)
+        if not del then reason = 'furnace construction not ready' end
     elseif t.type == TASK_TYPE.construct_stockpile then
         del = self:try_construct_stockpile(t.room)
+        if not del then reason = 'stockpile construction not ready' end
     elseif t.type == TASK_TYPE.construct_farmplot then
         del = self:try_construct_farmplot(t.room)
+        if not del then reason = 'farmplot construction not ready' end
     elseif t.type == TASK_TYPE.construct_activityzone then
         del = self:try_construct_activityzone(t.room)
+        if not del then reason = 'activity zone construction not ready' end
     elseif t.type == TASK_TYPE.construct_tradedepot then
         del = self:try_construct_tradedepot(t.room)
+        if not del then reason = 'trade depot construction not ready' end
     elseif t.type == TASK_TYPE.construct_windmill then
         del = self:try_construct_windmill(t.room)
+        if not del then reason = 'windmill construction not ready' end
     elseif t.type == TASK_TYPE.check_rooms then
         self:checkrooms()
     elseif t.type == TASK_TYPE.check_construct then
@@ -987,6 +1097,10 @@ function Plan:_run_generic_task(t)
                     any_furnish = true
                 end
             end
+            if any_furnish then
+                self:_log('furnishing ' .. describe_room(t.room) .. ' (+'
+                    .. #t.room.layout .. ' furniture)')
+            end
             if not any_furnish and t.room.status == 'finished' then
                 t.room.furnished = true
             end
@@ -997,6 +1111,9 @@ function Plan:_run_generic_task(t)
     elseif t.type == TASK_TYPE.furnish then
         if t.room and t.furniture then
             del = self:try_furnish(t.room, t.furniture)
+            if not del then
+                reason = 'furniture not placeable yet'
+            end
         else
             del = true
         end
@@ -1082,11 +1199,13 @@ end
 
 function Plan:initial_phase()
     local all_done = true
+    local queued_rooms, queued_corridors = 0, 0
     for _, r in ipairs(self.rooms) do
         if r.status == 'plan' then
             if r.type ~= 'corridor' then
                 r.status = 'dig'
                 self:add_task(TASK_TYPE.want_dig, r)
+                queued_rooms = queued_rooms + 1
                 all_done = false
             end
         end
@@ -1097,11 +1216,19 @@ function Plan:initial_phase()
             if r.status == 'plan' then
                 r.status = 'dig'
                 self:add_task(TASK_TYPE.want_dig, r)
+                queued_corridors = queued_corridors + 1
                 all_done = false
             end
         end
     end
+    if queued_rooms > 0 or queued_corridors > 0 then
+        self:_log('initial phase: queued ' .. queued_rooms .. ' rooms and '
+            .. queued_corridors .. ' corridors for digging')
+    end
     if all_done then
+        if not self.past_initial_phase then
+            self:_log('initial phase complete — all rooms dug')
+        end
         self.past_initial_phase = true
     end
 end
@@ -1120,6 +1247,8 @@ function Plan:digroom(room)
         self.nrdig[q] = (self.nrdig[q] or 0) + 1
     end
 
+    self:_log('digging ' .. describe_room(room) .. ' (queue ' .. q
+        .. ', ' .. room:dig_remaining() .. ' tiles of rock)')
     return true
 end
 
@@ -1177,11 +1306,19 @@ function Plan:checkroom(r)
     if r.status == 'designated' then
         if r:is_dug() then
             r.status = 'dug'
+            self:_log('room DUG: ' .. describe_room(r))
+            self:construct_room(r)
+        end
+    elseif r.status == 'dig' then
+        if r:is_dug() then
+            r.status = 'dug'
+            self:_log('room DUG: ' .. describe_room(r))
             self:construct_room(r)
         end
     elseif r.status == 'dug' then
         if r:constructions_done() then
             r.status = 'finished'
+            self:_log('room FINISHED: ' .. describe_room(r))
         end
     end
 
@@ -1245,6 +1382,7 @@ end
 -- ============================================================
 
 function Plan:construct_room(r)
+    self:_log('constructing ' .. describe_room(r))
     if r.type == 'workshop' then
         self:add_task(TASK_TYPE.construct_workshop, r)
     elseif r.type == 'furnace' then
@@ -1369,7 +1507,9 @@ end
 
 -- Generic building constructor. `r` is a room object providing min/max
 -- extents; falls back to canonical building size when they are equal.
-local function construct_at(r, btype, subtype, custom, fields, width, height)
+-- `abstract` marks material-less buildings (stockpiles, farm plots) —
+-- constructBuilding REQUIRES one of items/filters/abstract in 53.16.
+local function construct_at(r, btype, subtype, custom, fields, width, height, abstract)
     local pos = { x = r.min.x, y = r.min.y, z = r.min.z }
     local w = width or ((r.max.x - r.min.x) + 1)
     local h = height or ((r.max.y - r.min.y) + 1)
@@ -1381,6 +1521,7 @@ local function construct_at(r, btype, subtype, custom, fields, width, height)
         width = w,
         height = h,
         fields = fields,
+        abstract = abstract or nil,
     })
     if not ok or not bld then
         dfhack.println('[df-ai] construct failed at ('
@@ -1492,13 +1633,17 @@ function Plan:try_construct_stockpile(r)
 
     local width = (r.max.x - r.min.x) + 1
     local height = (r.max.y - r.min.y) + 1
-    local fields = {
-        room = { x = r.min.x, y = r.min.y, width = width, height = height },
-    }
-    local bld = construct_at(r, df.building_type.Stockpile, -1, -1, fields, width, height)
+    -- Stockpiles are ABSTRACT buildings (no construction materials):
+    -- constructBuilding without `abstract` looks for item filters and
+    -- fails with "one of items, filters or abstract is required"
+    -- (live-verified in the object testing arena, r3.6).
+    local bld = construct_at(r, df.building_type.Stockpile, -1, -1, nil, width, height, true)
     if bld then
         r.bld_id = bld.id
         self:configure_stockpile(bld, r.stockpile_type)
+        self:_log('stockpile built at ' .. tostring(r.min.x) .. ','
+            .. tostring(r.min.y) .. ',' .. tostring(r.min.z)
+            .. ' (bld ' .. bld.id .. ')')
         return true
     end
     return false
@@ -1521,12 +1666,13 @@ function Plan:try_construct_farmplot(r)
 
     local width = (r.max.x - r.min.x) + 1
     local height = (r.max.y - r.min.y) + 1
-    local fields = {
-        room = { x = r.min.x, y = r.min.y, width = width, height = height },
-    }
-    local bld = construct_at(r, df.building_type.FarmPlot, -1, -1, fields, width, height)
+    -- farm plots are abstract too (no materials, live-verified r3.6)
+    local bld = construct_at(r, df.building_type.FarmPlot, -1, -1, nil, width, height, true)
     if bld then
         r.bld_id = bld.id
+        self:_log('farm plot built at ' .. tostring(r.min.x) .. ','
+            .. tostring(r.min.y) .. ',' .. tostring(r.min.z)
+            .. ' (bld ' .. bld.id .. ')')
         -- v50 farmplots plant via plant_id[season]; stocks module fills the crop
         return true
     end
@@ -1613,6 +1759,10 @@ end
 
 function Plan:try_furnish(r, f)
     if not r or not f then return false end
+    -- 'none' furniture are layout placeholders from the templates, not
+    -- real buildings — complete silently (they were spamming the log:
+    -- "furniture has no building mapping: none", live-verified r3.6)
+    if f.type == 'none' then return true end
     local pos = f.pos
     if not pos then
         pos = r:pos()
@@ -1661,7 +1811,10 @@ function Plan:try_furnish(r, f)
     }
 
     local spec = name_map[f.type]
-    if not spec then return false end
+    if not spec then
+        self:_log('furniture has no building mapping: ' .. tostring(f.type))
+        return false
+    end
 
     local pseudo = { min = pos, max = pos }
     local ok, bld = pcall(dfhack.buildings.constructBuilding, {
@@ -1672,6 +1825,9 @@ function Plan:try_furnish(r, f)
     })
     if ok and bld then
         f.bld_id = bld.id
+        self:_log('placed ' .. tostring(f.type) .. ' at '
+            .. pos.x .. ',' .. pos.y .. ',' .. pos.z
+            .. ' (bld ' .. bld.id .. ')')
         return true
     end
     f.bld_id = -1
@@ -1705,7 +1861,14 @@ function Plan:getbedroom(unit_id)
 end
 
 function Plan:getcoffin()
-    dfhack.println('[df-ai] Need a coffin')
+    -- rate-limit: population calls this for every unburied corpse on
+    -- every update; without a limit it printed "Need a coffin" per tick
+    self._coffin_log = self._coffin_log or 0
+    local now = self:_tick_now()
+    if now - self._coffin_log > 1200 then
+        self._coffin_log = now
+        dfhack.println('[df-ai] Need a coffin (cemetery not ready yet)')
+    end
 end
 
 function Plan:getdiningroom(unit_id)

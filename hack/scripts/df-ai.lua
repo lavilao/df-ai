@@ -146,6 +146,31 @@ function AI:startup()
     if not self.plan or not self.population then
         self:load_modules()
     end
+    -- C++ parity (ai.cpp): `enable autolabor` + PLANT/HERBALIST caps.
+    -- Without labor management nobody has the MINING labor in a v50
+    -- manual-labor fort — designations sit forever and "the dwarves do
+    -- nothing". The autolabor plugin ships with DFHack 53.16-r3.
+    if self.config.manage_labors and self.config.manage_labors ~= '' then
+        safe(function()
+            dfhack.run_command('enable ' .. self.config.manage_labors)
+            local name = self.config.manage_labors
+            if name == 'autolabor' then
+                dfhack.run_command('autolabor PLANT 5 200')
+                dfhack.run_command('autolabor HERBALIST 1 3')
+            end
+            -- verify and log the real state (e.g. the plugin refuses to
+            -- run outside a loaded fortress — the object testing arena)
+            local ok_p, on = pcall(function()
+                return dfhack.plugins.isEnabled(name)
+            end)
+            if ok_p and on then
+                debug_log('labor management enabled: ' .. name)
+            else
+                debug_log('labor management (' .. name .. ') not active yet'
+                    .. ' — will engage in a loaded fortress')
+            end
+        end, 'enable labor management')
+    end
     -- each module starts INDEPENDENTLY: one broken module must not abort
     -- the whole chain again (repeating tasks + unpause always get to run)
     if self.population then safe(function() self.population:startup() end, 'population startup') end
@@ -159,6 +184,7 @@ function AI:startup()
     safe(function() self:register_repeating_tasks() end, 'repeating tasks')
     safe(function() self:unpause() end, 'unpause')
     safe(function() self:dismiss_popups() end, 'popup dismiss')
+    debug_log('fortress automation armed: ' .. self:heartbeat_line())
 end
 
 function AI:shutdown()
@@ -238,6 +264,13 @@ function AI:register_repeating_tasks()
     repeatutil.scheduleEvery(GLOBAL_KEY .. '-announce', 10, 'ticks', function()
         safe(function() self:watch_announcements() end, 'announcements')
     end)
+    -- Daily heartbeat: one status line per game day (1200 ticks) so the
+    -- console always shows what the automation is doing
+    repeatutil.scheduleEvery(GLOBAL_KEY .. '-heartbeat', 1200, 'ticks', function()
+        safe(function() self:heartbeat() end, 'heartbeat')
+    end)
+    -- unpause watchdog (frames, not ticks: ticks freeze while paused)
+    self:arm_unpause_watch()
 end
 
 -- v50 shows modal popups over the map on load (e.g. "You have arrived",
@@ -264,7 +297,118 @@ function AI:unpause()
     -- no longer exist in DFHack 50+
     if df.global.pause_state then
         df.global.pause_state = false
+        self.last_unpause_tick = (self.last_unpause_tick or 0) + 1
+        return true
     end
+    return false
+end
+
+-- C++ parity (ai.cpp): while the fort is PAUSED the AI's repeating 'tick'
+-- timers never fire — one pause event (strike announcement, season
+-- popup, combat) after startup froze the whole game forever. The C++
+-- version force-unpauses after 10 seconds stuck. Frame-based (NOT tick-
+-- based: ticks do not advance while paused!).
+function AI:arm_unpause_watch()
+    if self.unpause_watch_armed then return end
+    self.unpause_watch_armed = true
+    self.paused_frames = 0
+    local function poll()
+        self.unpause_watch_armed = true
+        if not ai_enabled or not dfhack.isMapLoaded() then
+            self.unpause_watch_armed = false
+            return
+        end
+        local ok, paused = pcall(function() return df.global.pause_state end)
+        if ok and paused then
+            self.paused_frames = (self.paused_frames or 0) + 30 -- ~0.5s at 60fps
+            -- after ~5 seconds stuck paused, force unpause + dismiss popups
+            if self.paused_frames >= 300 then
+                self.paused_frames = 0
+                safe(function() self:unpause() end, 'watchdog unpause')
+                safe(function() self:dismiss_popups() end, 'watchdog popups')
+                debug_log('watchdog: force-unpaused the game (was stuck paused)')
+            end
+        else
+            self.paused_frames = 0
+        end
+        dfhack.timeout(30, 'frames', poll)
+    end
+    dfhack.timeout(30, 'frames', poll)
+end
+
+-- One compact status line describing what the AI is doing right now.
+-- Printed at startup and once per game day (the "heartbeat") so the
+-- console shows the fort's actual progress.
+function AI:heartbeat_line()
+    local parts = {}
+    -- population
+    local ok_c, citizens = pcall(function()
+        local n = 0
+        for _, u in ipairs(df.global.world.units.active) do
+            if dfhack.units.isCitizen(u, true) then n = n + 1 end
+        end
+        return n
+    end)
+    if ok_c then table.insert(parts, 'dwarves ' .. tostring(citizens)) end
+    -- idlers (no current job, civilian)
+    local ok_i, idlers = pcall(function()
+        local n = 0
+        for _, u in ipairs(df.global.world.units.active) do
+            if dfhack.units.isCitizen(u, true) and dfhack.units.isAlive(u)
+                and (u.job.current_job == nil) then
+                n = n + 1
+            end
+        end
+        return n
+    end)
+    if ok_i then table.insert(parts, 'idle ' .. tostring(idlers)) end
+    -- plan rooms by status
+    if self.plan and self.plan.rooms then
+        local by_status = {}
+        for _, r in ipairs(self.plan.rooms) do
+            by_status[r.status] = (by_status[r.status] or 0) + 1
+        end
+        local s = {}
+        for _, k in ipairs({ 'plan', 'dig', 'designated', 'dug', 'finished' }) do
+            if by_status[k] then table.insert(s, k .. ' ' .. by_status[k]) end
+        end
+        if #s > 0 then table.insert(parts, 'rooms: ' .. table.concat(s, ', ')) end
+        table.insert(parts, 'tasks ' .. #self.plan.tasks_generic
+            .. '+' .. #self.plan.tasks_furniture)
+    end
+    -- pending dig designations on the whole map
+    local ok_d, digs = pcall(function()
+        local n = 0
+        for _, bl in ipairs(df.global.world.map.map_blocks) do
+            if bl.flags.designated then
+                for lx = 0, 15 do
+                    for ly = 0, 15 do
+                        if bl.designation[lx][ly].dig ~= df.tile_dig_designation.No then
+                            n = n + 1
+                        end
+                    end
+                end
+            end
+        end
+        return n
+    end)
+    if ok_d then table.insert(parts, 'dig desig ' .. tostring(digs)) end
+    -- manager orders
+    local ok_m, orders = pcall(function()
+        local h = df.global.world.manager_orders
+        return h and #h.all or 0
+    end)
+    if ok_m then table.insert(parts, 'mgr orders ' .. tostring(orders)) end
+    -- jobs in flight
+    local ok_j, jobs = pcall(function() return #df.global.world.jobs.list end)
+    if ok_j then table.insert(parts, 'jobs ' .. tostring(jobs)) end
+    local ok_p, paused = pcall(function() return df.global.pause_state end)
+    if ok_p and paused then table.insert(parts, 'PAUSED') end
+    return '[df-ai] ' .. table.concat(parts, ' | ')
+end
+
+function AI:heartbeat()
+    debug_log(self:heartbeat_line())
 end
 
 function AI:abandon()

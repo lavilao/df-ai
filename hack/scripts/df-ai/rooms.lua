@@ -266,50 +266,212 @@ function room:safe_include(c)
 end
 
 function room:dig_mode(c)
-    -- Determine what dig designation to use for a given tile in this room
+    -- Determine what dig designation to use for a given tile in this room.
+    -- Multi-z corridors (stairwells) need UpDownStair so dwarves can
+    -- actually walk between the levels once dug — a Default-dug vertical
+    -- shaft is an un-walkable pit.
     if self.channeled then
         return df.tile_dig_designation.Channel
     end
-    if self.type == TYPE.cistern and self.cistern_type == CISTERN_TYPE.well then
-        return df.tile_dig_designation.Default
+    if self.type == TYPE.corridor and (self.max.z > self.min.z) then
+        return df.tile_dig_designation.UpDownStair
     end
     return df.tile_dig_designation.Default
 end
 
+local TTS = df.tiletype_shape
+
+-- Tile shape for (x, y, z) — df.tiletype.attrs[tile].shape. Returns nil
+-- when the tile/block cannot be read.
+local function tile_shape(x, y, z)
+    local ok_t, tt = pcall(function()
+        local b = dfhack.maps.getTileBlock(x, y, z)
+        if not b then return nil end
+        return b.tiletype[x % 16][y % 16]
+    end)
+    if not ok_t or tt == nil then return nil end
+    local ok_s, shape = pcall(function() return df.tiletype.attrs[tt].shape end)
+    if not ok_s then return nil end
+    return shape
+end
+
+local SHAPE_IS_WALL = {}
+local SHAPE_KNOWN = {}
+local function ensure_shape_tables()
+    if next(SHAPE_IS_WALL) then return end
+    -- Shapes whose basic_shape is Wall block a room from being "dug".
+    -- (Explicit table: no df.tiletype_shape.attrs exists in 53.16.)
+    local walls = {
+        'WALL', 'FORTIFICATION', 'TREE', 'TWIG', 'BRANCH',
+        'TRUNK_BRANCH', 'ROOT',
+    }
+    local known = {
+        'WALL', 'FORTIFICATION', 'TREE', 'TWIG', 'BRANCH',
+        'TRUNK_BRANCH', 'ROOT', 'FLOOR', 'BOULDER', 'PEBBLES', 'RAMP',
+        'STAIR_UP', 'STAIR_DOWN', 'STAIR_UPDOWN', 'RAMP_TOP',
+        'BROOK_TOP', 'BROOK_BED', 'RIVER_BED', 'SAPLING', 'SHRUB',
+        'OPEN_SPACE', 'ENDLESS_PIT',
+    }
+    for _, name in ipairs(walls) do
+        local v = TTS[name]
+        if v ~= nil then SHAPE_IS_WALL[v] = true end
+    end
+    for _, name in ipairs(known) do
+        local v = TTS[name]
+        if v ~= nil then SHAPE_KNOWN[v] = true end
+    end
+end
+
+local function shape_is_wall(shape)
+    if shape == nil then return false end
+    ensure_shape_tables()
+    if SHAPE_KNOWN[shape] then
+        return SHAPE_IS_WALL[shape] == true
+    end
+    -- unknown shape: only the literal WALL/FORTIFICATION shapes block a room
+    return shape == TTS.WALL or shape == TTS.FORTIFICATION
+end
+
+local function tile_is_wall(x, y, z)
+    local shape = tile_shape(x, y, z)
+    return shape ~= nil and shape_is_wall(shape)
+end
+
+-- ============================================================
+-- dig() — C++ room::dig parity (r3.6)
+--
+-- The r3.5 version set `des.dig = Default` on EVERY tile in the room's
+-- bounds — including open air, floors, shrubs and constructions. Those
+-- designations are invalid: DF generates no job for them, nothing ever
+-- clears them, and the old is_dug() (which checked designations instead
+-- of tile shapes) therefore NEVER returned true. Rooms stayed 'dig'
+-- forever, nrdig filled every dig slot, and the whole plan pipeline
+-- deadlocked — the dwarves stood idle next to a fully-designated map.
+--
+-- The C++ original (room.cpp) only designates:
+--   * tiles whose shape is WALL (Default designation), or
+--   * non-open tiles when the designation is DownStair/Channel
+--   * skips CONSTRUCTION-material tiles
+-- plus the per-furniture digs (stairs for layout items with f.dig).
+-- It also runs dig_tile() which marks the block as designated.
+-- ============================================================
 function room:dig()
+    local designated = 0
+    local cleared = 0
     for z = self.min.z, self.max.z do
         for x = self.min.x, self.max.x do
             for y = self.min.y, self.max.y do
-                local tile = dfhack.maps.getTileBlock(x, y, z)
-                if tile then
-                    local des = tile.designation[x % 16][y % 16]
-                    if des and des.dig == df.tile_dig_designation.No then
-                        des.dig = self:dig_mode(coord_new(x, y, z))
-                        if not tile.flags.designated then
-                            tile.flags.designated = true
+                local block = dfhack.maps.getTileBlock(x, y, z)
+                if block then
+                    local lx, ly = x % 16, y % 16
+                    local tt = block.tiletype[lx][ly]
+                    local des = block.designation[lx][ly]
+                    if tt ~= nil and des ~= nil then
+                        local shape = df.tiletype.attrs[tt].shape
+                        local dm = self:dig_mode(coord_new(x, y, z))
+                        local is_wall = shape ~= nil and shape_is_wall(shape)
+                        local is_open = (shape == TTS.OPEN_SPACE
+                            or shape == TTS.RAMP_TOP)
+                        local stair_needed = (dm == df.tile_dig_designation.UpDownStair
+                            or dm == df.tile_dig_designation.Channel
+                            or dm == df.tile_dig_designation.DownStair)
+                        local wants = (is_wall and dm ~= df.tile_dig_designation.Channel)
+                            or (stair_needed and not is_open and not is_wall)
+                        if wants and des.dig == df.tile_dig_designation.No then
+                            des.dig = dm
+                            block.flags.designated = true
+                            designated = designated + 1
+                        elseif not wants and des.dig ~= df.tile_dig_designation.No then
+                            -- self-heal: clear invalid designations left by
+                            -- older df-ai builds (r3.4/r3.5 wrote Default on
+                            -- floors/open air; those never clear by themselves)
+                            local cur = des.dig
+                            if cur == df.tile_dig_designation.Default and not is_wall then
+                                des.dig = df.tile_dig_designation.No
+                                cleared = cleared + 1
+                            end
                         end
                     end
                 end
             end
         end
     end
-end
 
-function room:is_dug()
-    for z = self.min.z, self.max.z do
-        for x = self.min.x, self.max.x do
-            for y = self.min.y, self.max.y do
-                local tile = dfhack.maps.getTileBlock(x, y, z)
-                if tile then
-                    local des = tile.designation[x % 16][y % 16]
-                    if des and des.dig ~= df.tile_dig_designation.No then
-                        return false
+    -- Per-furniture digs (stairs down into the room, channels, ...)
+    -- C++ AI::dig_tile OVERWRITES the designation (des->bits.dig = dig
+    -- unconditionally) — the room loop above may have put Default on the
+    -- wall already; the furniture's explicit dig wins.
+    for _, f in ipairs(self.layout) do
+        local p = f.pos
+        if p and f.dig and f.dig ~= df.tile_dig_designation.No then
+            local block = dfhack.maps.getTileBlock(p.x, p.y, p.z)
+            if block then
+                local lx, ly = p.x % 16, p.y % 16
+                local tt = block.tiletype[lx][ly]
+                local des = block.designation[lx][ly]
+                if tt ~= nil and des ~= nil then
+                    local shape = df.tiletype.attrs[tt].shape
+                    local is_wall = shape ~= nil and shape_is_wall(shape)
+                    local is_open = (shape == TTS.OPEN_SPACE or shape == TTS.RAMP_TOP)
+                    if (f.dig ~= df.tile_dig_designation.Default and (is_wall
+                        or (f.dig == df.tile_dig_designation.Channel and not is_open)))
+                        or (f.dig == df.tile_dig_designation.Default and is_wall) then
+                        des.dig = f.dig
+                        block.flags.designated = true
+                        designated = designated + 1
                     end
                 end
             end
         end
     end
-    return true
+
+    return designated, cleared
+end
+
+-- ============================================================
+-- is_dug() — C++ room::is_dug parity (r3.6): SHAPE-based.
+-- A room is dug when no interior tile is still a WALL (ignoring
+-- furniture holes whose dig is No). The old version checked
+-- `des.dig ~= No`, which never became true while invalid floor
+-- designations sat on the map.
+-- ============================================================
+function room:is_dug()
+    local reason = nil
+    local holes = {}
+    for _, f in ipairs(self.layout) do
+        local p = f.pos
+        if p and not f.ignore and f.dig == df.tile_dig_designation.No then
+            holes[p.x .. ',' .. p.y .. ',' .. p.z] = true
+        end
+    end
+    for z = self.min.z, self.max.z do
+        for x = self.min.x, self.max.x do
+            for y = self.min.y, self.max.y do
+                if not holes[x .. ',' .. y .. ',' .. z] then
+                    if tile_is_wall(x, y, z) then
+                        reason = 'wall at ' .. x .. ',' .. y .. ',' .. z
+                        return false, reason
+                    end
+                end
+            end
+        end
+    end
+    return true, nil
+end
+
+-- Count of still-undug interior tiles (for progress logging)
+function room:dig_remaining()
+    local n = 0
+    for z = self.min.z, self.max.z do
+        for x = self.min.x, self.max.x do
+            for y = self.min.y, self.max.y do
+                if tile_is_wall(x, y, z) then
+                    n = n + 1
+                end
+            end
+        end
+    end
+    return n
 end
 
 function room:constructions_done()

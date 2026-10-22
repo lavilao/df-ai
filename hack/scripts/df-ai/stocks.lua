@@ -291,6 +291,26 @@ function Stocks:queue_order(job_type, item_type, item_subtype, amount, mat_type,
         mat_type = mat_type,
         mat_index = mat_index,
     }
+    if order then
+        -- r3.6: every queued manager order is logged (once) so the
+        -- console shows what production the AI actually ordered.
+        -- (enum tables do NOT iterate with pairs() — use the numeric
+        -- range with reverse lookup, same lesson as keyhunt)
+        local ok_n, name = pcall(function()
+            local jt = df.job_type
+            for v = jt._first_item or 0, jt._last_item or 999 do
+                if v == job_type then return jt[v] end
+            end
+            return tostring(job_type)
+        end)
+        self._order_log = self._order_log or {}
+        local key = tostring(name) .. '/' .. tostring(item_subtype)
+        if not self._order_log[key] then
+            self._order_log[key] = true
+            dfhack.println('[df-ai:stocks] manager order queued: ' .. tostring(name)
+                .. ' x' .. tostring(amount))
+        end
+    end
     return order ~= nil
 end
 

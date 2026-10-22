@@ -145,6 +145,13 @@ df_mock.main_choice_type = {
 df_mock.help_context_type = { [1] = 'POPUP_A', [2] = 'POPUP_B', [3] = 'OTHER_X' }
 df_mock.game_type = { DWARF_MAIN = 0, ADVENTURE_MAIN = 1 }
 
+df_mock.tile_dig_designation = {
+    No = 0, Default = 1, Channel = 2, UpDownStair = 3, DownStair = 4,
+    UpStair = 5, Ramp = 6,
+}
+df_mock.tiletype_shape.OPEN_SPACE = 10
+df_mock.tiletype_shape.RAMP_TOP = 11
+
 local dfhack_mock = {}
 dfhack_mock.println = function(...) end
 dfhack_mock.printerr = function(...) end
@@ -875,6 +882,117 @@ do
 end
 
 -- ============================================================
+
+-- ============================================================
+-- 10. r3.6: shape-based dig()/is_dug() (the idle-dwarf pipeline deadlock)
+-- ============================================================
+do
+    print('--- r3.6: room:dig designates only WALL tiles ---')
+    local rooms_mod
+    do
+        local ok, m = pcall(dofile, SCRIPTS .. '/df-ai/rooms.lua')
+        check(ok, 'rooms module loads standalone: ' .. tostring(m))
+        rooms_mod = m
+    end
+
+    -- per-tile block mock: tiletype[x][y] and designation[x][y],
+    -- one INDEPENDENT block per z (like the real map)
+    local SHAPE = { FLOOR = 1, WALL = 2, OPEN = 10 }
+    local blocks = {}
+    local function make_block(z)
+        local b = {}
+        b.flags = { designated = false }
+        b.tiletype = {}
+        b.designation = {}
+        for x = 0, 15 do
+            b.tiletype[x] = {}
+            b.designation[x] = {}
+            for y = 0, 15 do
+                b.tiletype[x][y] = SHAPE.FLOOR
+                b.designation[x][y] = { dig = df_mock.tile_dig_designation.No }
+            end
+        end
+        blocks[z] = b
+        return b
+    end
+    for z = 90, 110 do make_block(z) end
+    local block = blocks[100]
+    -- room spans 3x3 at (10..12, 10..12, 100): walls in the middle column
+    for y = 10, 12 do
+        block.tiletype[11][y] = SHAPE.WALL
+    end
+    -- stale r3.5-era garbage: Default designation on a FLOOR corner
+    block.designation[10][10].dig = df_mock.tile_dig_designation.Default
+    -- and open air at another corner
+    block.tiletype[12][12] = SHAPE.OPEN
+    block.designation[12][12].dig = df_mock.tile_dig_designation.Default
+
+    local TDD = df_mock.tile_dig_designation
+    local old_getTileBlock = dfhack_mock.maps.getTileBlock
+    dfhack_mock.maps.getTileBlock = function(x, y, z)
+        return blocks[z]
+    end
+
+    local r = rooms_mod.room.new('bedroom',
+        { x = 10, y = 10, z = 100 }, { x = 12, y = 12, z = 100 }, {})
+    local designated, cleared = r:dig()
+
+    check(designated == 3, 'only the 3 WALL tiles designated, got ' .. tostring(designated))
+    check(cleared == 2, 'stale designations on floor+open cleared, got ' .. tostring(cleared))
+    check(block.designation[11][10].dig == TDD.Default, 'wall tile got Default designation')
+    check(block.designation[10][11].dig == TDD.No, 'floor tile NOT designated')
+    check(block.designation[12][12].dig == TDD.No, 'open-air tile designation cleared')
+    check(block.flags.designated == true, 'block marked designated')
+
+    print('--- r3.6: room:is_dug is shape-based ---')
+    local dug, why = r:is_dug()
+    check(dug == false, 'room with walls is not dug (reason: ' .. tostring(why) .. ')')
+    -- "mine" the walls: shape becomes floor
+    for y = 10, 12 do block.tiletype[11][y] = SHAPE.FLOOR end
+    local dug2 = r:is_dug()
+    check(dug2 == true, 'room with no walls IS dug (designations ignored)')
+    check(r:dig_remaining() == 0, 'dig_remaining == 0 after mining')
+    block.tiletype[10][11] = SHAPE.WALL
+    check(r:dig_remaining() == 1, 'dig_remaining counts a wall')
+
+    print('--- r3.6: multi-z corridors dig UpDownStair ---')
+    local c = rooms_mod.room.new('corridor',
+        { x = 5, y = 5, z = 98 }, { x = 5, y = 5, z = 100 },
+        { corridor_type = 'corridor' })
+    -- all three tiles are walls (one per z-level block)
+    for z = 98, 100 do
+        blocks[z].tiletype[5][5] = SHAPE.WALL
+    end
+    local d2 = c:dig_mode()
+    check(d2 == TDD.UpDownStair, 'multi-z corridor dig_mode is UpDownStair')
+    local des2 = c:dig()
+    check(des2 == 3, 'stairwell tiles designated (got ' .. tostring(des2) .. ')')
+    check(blocks[99].designation[5][5].dig == TDD.UpDownStair,
+        'stairwell got UpDownStair designation on every level')
+    check(blocks[98].designation[5][5].dig == TDD.UpDownStair
+        and blocks[100].designation[5][5].dig == TDD.UpDownStair,
+        'top and bottom stairwell tiles designated too')
+    -- single-z corridor still Default
+    local c1 = rooms_mod.room.new('corridor',
+        { x = 5, y = 5, z = 99 }, { x = 5, y = 5, z = 99 },
+        { corridor_type = 'corridor' })
+    check(c1:dig_mode() == TDD.Default, 'flat corridor dig_mode is Default')
+
+    print('--- r3.6: furniture digs (stairs into the room) ---')
+    -- furniture with explicit dig on a wall tile
+    block.tiletype[10][12] = SHAPE.WALL
+    block.designation[10][12].dig = TDD.No
+    local r2 = rooms_mod.room.new('cistern',
+        { x = 10, y = 10, z = 100 }, { x = 12, y = 12, z = 100 }, {})
+    r2.layout = { rooms_mod.furniture.new('well',
+        { x = 10, y = 12, z = 100 }, { dig = TDD.UpDownStair }) }
+    local fdes = r2:dig()
+    check(block.designation[10][12].dig == TDD.UpDownStair,
+        'furniture dig designation applied to wall tile')
+
+    dfhack_mock.maps.getTileBlock = old_getTileBlock
+end
+
 print(failures == 0 and '=== ALL UNIT TESTS PASS ==='
     or ('=== ' .. failures .. ' FAILURES ==='))
 os.exit(failures == 0 and 0 or 1)
