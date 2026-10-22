@@ -81,11 +81,17 @@ end
 function Plan:startup()
     self:load_rooms_module()
     self:load_blueprint()
-    self:plan_setup()
-    self:add_task(TASK_TYPE.check_rooms)
-    self.past_initial_phase = false
-    self.should_search_for_metal = true
-    self.setup_done = true
+    if self:plan_setup() then
+        self:add_task(TASK_TYPE.check_rooms)
+        self.past_initial_phase = false
+        self.should_search_for_metal = true
+        self.setup_done = true
+    else
+        -- setup_done stays false: Plan:update retries (blocks may not be
+        -- loaded yet on the very first ticks after embark)
+        self.setup_attempts = (self.setup_attempts or 0) + 1
+        dfhack.println('[df-ai] plan setup deferred (attempt ' .. self.setup_attempts .. ')')
+    end
 end
 
 function Plan:load_rooms_module()
@@ -99,7 +105,16 @@ function Plan:update()
     self.last_update_year = df.global.cur_year
     self.last_update_tick = df.global.cur_year_tick
 
-    if not self.setup_done then return end
+    if not self.setup_done then
+        -- bounded retry: setup failed at startup (e.g. map not ready);
+        -- after 10 attempts the plan stays off but everything else keeps
+        -- running (stocks, population, camera)
+        self.setup_attempts = self.setup_attempts or 0
+        if self.setup_attempts < 10 then
+            self:startup()
+        end
+        return
+    end
 
     if self.bg_idx_generic == nil then
         self.bg_idx_generic = 1
@@ -237,16 +252,18 @@ end
 -- ============================================================
 
 function Plan:plan_setup()
+    -- Returns true when the room layout was placed; false lets the caller
+    -- retry on a later update (map blocks may not be loaded yet).
     if not self.plan_config then
         dfhack.println('[df-ai] No plan config loaded, skipping setup')
-        return
+        return false
     end
 
     if not rooms_module then
         self:load_rooms_module()
         if not rooms_module then
             dfhack.println('[df-ai] Rooms module not available, skipping setup')
-            return
+            return false
         end
     end
 
@@ -254,33 +271,48 @@ function Plan:plan_setup()
     local entrance = self:find_fort_entrance()
     if not entrance then
         dfhack.println('[df-ai] Could not find fort entrance location')
-        return
+        return false
     end
     self.fort_entrance = entrance
     dfhack.println('[df-ai] Fort entrance at ' .. entrance.x .. ',' .. entrance.y .. ',' .. entrance.z)
 
-    -- Create the start room at entrance
-    self:_place_start(entrance)
+    -- Create the start room at entrance (one bad template must not kill
+    -- the whole layout)
+    local ok_start = pcall(function() self:_place_start(entrance) end)
+    if not ok_start then
+        dfhack.printerr('[df-ai] warning: start room placement failed')
+    end
 
     -- Place other rooms based on plan priorities
     local priorities = self.plan_config.priorities
     if priorities then
         for _, tag in ipairs(priorities) do
             if tag ~= 'generic01_start' then
-                self:_place_room_tag(tag, entrance)
+                local ok_tag, err = pcall(function()
+                    self:_place_room_tag(tag, entrance)
+                end)
+                if not ok_tag then
+                    dfhack.printerr('[df-ai] warning: room batch ' .. tag .. ' failed: ' .. tostring(err))
+                end
             end
         end
     end
 
     -- Connect all rooms with corridors (BFS pathfinding)
-    self:_connect_all_corridors()
+    local ok_conn, err_conn = pcall(function() self:_connect_all_corridors() end)
+    if not ok_conn then
+        dfhack.printerr('[df-ai] warning: corridor connection failed: ' .. tostring(err_conn))
+    end
 
     -- Sort rooms by distance from entrance for priority
-    table.sort(self.rooms, function(a, b)
-        return a:distance_to(self.fort_entrance) < b:distance_to(self.fort_entrance)
+    pcall(function()
+        table.sort(self.rooms, function(a, b)
+            return a:distance_to(self.fort_entrance) < b:distance_to(self.fort_entrance)
+        end)
     end)
 
     dfhack.println('[df-ai] Setup complete: ' .. #self.rooms .. ' rooms, ' .. #self.corridors .. ' corridors')
+    return true
 end
 
 -- Ground shapes for the surface scan. Enum-table lookups are plain table
@@ -299,42 +331,112 @@ local function is_ground_shape(shape)
     return GROUND_SHAPES[shape] == true
 end
 
-function Plan:find_fort_entrance()
-    -- v50 REMOVED plotinfo.embark_pos entirely, and reading a struct field
-    -- that does not exist THROWS in the DFHack Lua wrapper — that single
-    -- read is what crashed AI startup ("startup failed: ...embark_pos:
-    -- not found") and left the dwarves doing nothing. The original df-ai
-    -- places the fort entrance at the CENTER of the local map on the
-    -- surface, which is what the generic01 plan is designed around.
-    local ok_s, size = pcall(function() return dfhack.maps.getMapSize() end)
-    if not ok_s or not size or not size.x or not size.y or not size.z then
-        return nil
-    end
-    -- integer coordinates: getMapSize().x / 2 produces x.5 on odd maps and
-    -- non-integer tile indices throw
-    local center_x = math.floor((size.x - 1) / 2)
-    local center_y = math.floor((size.y - 1) / 2)
-
-    -- walk down from the top of the map at the center tile until solid
-    -- ground is found (skips trees, shrubs, and open air)
-    for z = size.z - 1, 0, -1 do
-        local ok_b, block = pcall(dfhack.maps.getTileBlock, center_x, center_y, z)
+-- Walk down from the top of the map at (x, y) until solid ground is found
+-- (skips trees, shrubs, and open air). Returns the z of the first ground
+-- tile, or nil. Every DF field read is pcall-wrapped: the 53.16 wrapper
+-- THROWS on any field that does not exist.
+local function ground_z_at(x, y, z_top)
+    for z = z_top, 0, -1 do
+        local ok_b, block = pcall(dfhack.maps.getTileBlock, x, y, z)
         if ok_b and block then
             local ok_t, tile = pcall(function()
-                return block.tiletype[center_x % 16][center_y % 16]
+                return block.tiletype[x % 16][y % 16]
             end)
             if ok_t and tile then
                 local ok_a, shape = pcall(function()
                     return df.tiletype.attrs[tile].shape
                 end)
                 if ok_a and is_ground_shape(shape) then
-                    return { x = center_x, y = center_y, z = z }
+                    return z
                 end
             end
         end
     end
+    return nil
+end
+
+function Plan:find_fort_entrance()
+    -- v50 REMOVED plotinfo.embark_pos entirely, and reading a struct field
+    -- that does not exist THROWS in the DFHack Lua wrapper — that single
+    -- read is what crashed AI startup ("startup failed: ...embark_pos:
+    -- not found") and left the dwarves doing nothing.
+    -- Also NOTE: dfhack.maps.getMapSize does NOT exist in 53.16 (it is
+    -- getTileSize, and it returns x, y, z as THREE values — not a table).
+    -- The original df-ai anchors the plan where the embark wagon stands:
+    --   1. the wagon building (placed by the game at every new embark)
+    --   2. the citizen centroid (reclaims, or the wagon already gone)
+    --   3. a surface scan at the map center (last resort)
+    local ok_s, mw, mh, md = pcall(function()
+        return dfhack.maps.getTileSize()
+    end)
+    -- NOTE: 0 is truthy in Lua — at the title screen getTileSize returns
+    -- 0,0,0, and those must count as "no map"
+    if not ok_s or not mw or not mh or not md
+        or mw <= 0 or mh <= 0 or md <= 0 then
+        return nil
+    end
+    local world = df.global.world
+
+    -- 1) the embark wagon
+    local ok_bld, buildings = pcall(function()
+        return world and world.buildings and world.buildings.all or nil
+    end)
+    if ok_bld and buildings then
+        for _, b in ipairs(buildings) do
+            local ok_w, is_wagon = pcall(function()
+                return df.building_wagonst:is_instance(b)
+            end)
+            if ok_w and is_wagon and b then
+                local ok_c, wx, wy = pcall(function()
+                    return math.floor((b.x1 + b.x2) / 2), math.floor((b.y1 + b.y2) / 2)
+                end)
+                if ok_c and wx and wx >= 0 then
+                    local wz = ground_z_at(wx, wy, b.z) or b.z
+                    return { x = wx, y = wy, z = wz }
+                end
+            end
+        end
+    end
+
+    -- 2) the citizen centroid
+    local ok_u, units = pcall(function()
+        return world and world.units and world.units.all or nil
+    end)
+    if ok_u and units then
+        local sx, sy, sz, n = 0, 0, 0, 0
+        for _, u in ipairs(units) do
+            local ok_c, is_c = pcall(function()
+                return dfhack.units.isCitizen(u, true) and dfhack.units.isAlive(u)
+            end)
+            if ok_c and is_c then
+                -- 53.16: getPosition returns x, y, z as three values
+                local ok_p, ux, uy, uz = pcall(function()
+                    return dfhack.units.getPosition(u)
+                end)
+                if ok_p and ux and ux >= 0 and uy and uz then
+                    sx, sy, sz, n = sx + ux, sy + uy, sz + uz, n + 1
+                end
+            end
+        end
+        if n > 0 then
+            return {
+                x = math.floor(sx / n + 0.5),
+                y = math.floor(sy / n + 0.5),
+                z = math.floor(sz / n + 0.5),
+            }
+        end
+    end
+
+    -- 3) map-center surface scan (integer coordinates: (size - 1) / 2
+    -- avoids x.5 on odd maps; non-integer tile indices throw)
+    local center_x = math.floor((mw - 1) / 2)
+    local center_y = math.floor((mh - 1) / 2)
+    local z = ground_z_at(center_x, center_y, md - 1)
+    if z then
+        return { x = center_x, y = center_y, z = z }
+    end
     -- last resort: top of the map (a plan anchored in a tree beats no plan)
-    return { x = center_x, y = center_y, z = size.z - 1 }
+    return { x = center_x, y = center_y, z = md - 1 }
 end
 
 function Plan:_place_start(entrance)
@@ -594,7 +696,14 @@ function Plan:_connect_all_corridors()
                 end
             end
             if nearest then
-                self:_dig_corridor_between(r, nearest)
+                -- a failing BFS (unwalkable map edge, etc.) must not kill
+                -- the remaining connections
+                local ok_corr = pcall(function()
+                    self:_dig_corridor_between(r, nearest)
+                end)
+                if not ok_corr then
+                    dfhack.printerr('[df-ai] warning: corridor to a ' .. tostring(r.type) .. ' room failed')
+                end
                 connected[r] = true
             end
         end

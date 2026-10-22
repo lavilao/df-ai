@@ -5,6 +5,10 @@ Population.__index = Population
 
 local compat = dfhack.run_script_with_env(nil, 'df-ai/compat', {module = true})
 
+-- Resolved lazily by update_crimes: true only when the 0.47-era
+-- unit_flags1.prisoner/.criminal bits still exist on this DF version.
+local JUSTICE_FLAGS_OK = nil
+
 local LABOR_IMPORTANT = {
     [df.unit_labor.MINE] = true,
     [df.unit_labor.CARPENTER] = true,
@@ -360,24 +364,25 @@ end
 function Population:update_nobles()
     if not self.ai.config.manage_nobles then return end
 
-    -- v50+: position assignments live on the fortress entity
-    local fort = compat.fort_entity()
-    if not fort or not fort.assignments then return end
-
-    for _, assign in ipairs(fort.assignments) do
-        if assign.histfig >= 0 then
-            local histfig = df.historical_figure.find(assign.histfig)
-            local unit_id = histfig and histfig.unit_id or -1
-            if unit_id >= 0 then
-                -- Assign a bedroom to the noble
-                if self.ai.plan then
-                    local room = self.ai.plan:getbedroom(unit_id)
-                    if room then
-                        self.noble_rooms[unit_id] = room
+    -- v50: position assignments moved off historical_entity.assignments
+    -- (field REMOVED in 53.16 — the read threw on every population pass);
+    -- compat.assignments() flattens the per-type vectors instead.
+    for _, assign in ipairs(compat.assignments()) do
+        pcall(function()
+            if assign.histfig and assign.histfig >= 0 then
+                local histfig = df.historical_figure.find(assign.histfig)
+                local unit_id = histfig and histfig.unit_id or -1
+                if unit_id >= 0 then
+                    -- Assign a bedroom to the noble
+                    if self.ai.plan then
+                        local room = self.ai.plan:getbedroom(unit_id)
+                        if room then
+                            self.noble_rooms[unit_id] = room
+                        end
                     end
                 end
             end
-        end
+        end)
     end
 end
 
@@ -386,6 +391,17 @@ end
 -- ============================================================
 
 function Population:update_crimes()
+    -- v50 REMOVED the unit_flags1 prisoner and criminal bits entirely.
+    -- Probe once whether both bits exist; without them justice
+    -- automation is off (it crashed every population pass on 53.16).
+    if JUSTICE_FLAGS_OK == nil then
+        local f = df.unit_flags1:new()
+        JUSTICE_FLAGS_OK = pcall(function() return f.prisoner end)
+            and pcall(function() return f.criminal end)
+        pcall(function() f:delete() end)
+    end
+    if not JUSTICE_FLAGS_OK then return end
+
     local year = df.global.cur_year
     local tick = df.global.cur_year_tick
 
@@ -531,15 +547,19 @@ function Population:update_caged()
 
     for _, unit in ipairs(units) do
         if dfhack.units.isAlive(unit) and dfhack.units.isCitizen(unit) then
-            -- Check if unit is in a cage
-            if unit.flags1.caged then
-                -- Find the cage and release
-                local cage = unit.cage
-                if cage then
-                    cage:removeUnit(unit)
-                    unit.cage = nil
-                    unit.flags1.caged = false
-                end
+            -- Check if unit is in a cage (release path is version-fragile:
+            -- unit.cage / cage:removeUnit are not guaranteed on 53.16, so
+            -- it is fully pcall-wrapped — worst case the citizen waits)
+            local ok_c, caged = pcall(function() return unit.flags1.caged end)
+            if ok_c and caged then
+                pcall(function()
+                    local cage = unit.cage
+                    if cage then
+                        cage:removeUnit(unit)
+                        unit.cage = nil
+                        unit.flags1.caged = false
+                    end
+                end)
             end
         end
     end

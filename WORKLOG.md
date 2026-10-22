@@ -216,3 +216,25 @@ Live E2E at the user's EXACT resolution (1366x768, 170x64 grid), world save pres
 title(Start clicked) → world list(first world clicked) → adopt_region(auto-loads) → choose_game_type(Fortress clicked) → site screen(quick start + scored site, score -35) — the entire pre-embark chain now runs hands-free. Remaining known limitation: the final green [Embark] button ignores ALL synthetic input in the headless Xvfb environment (gps AND real X11 clicks — re-verified); the console prints a manual-click instruction as fallback. Real displays are expected to behave (every other button did).
 
 Stage summary: fortress AI startup unblocked; Continue Playing auto-flow implemented and click-calibrated; worldgen automated; announcement watcher un-crashed; CI extended with unit tests.
+
+## Session 8 — r3.4: in-fortress API drift fixed (user report: "Embarca automaticamente!! lamentablemente los enanos no parecen hacer nada")
+
+The r3.3 auto-embark flow WORKED on the user's machine (Continue Playing → world → save → fortress loaded, AI started, 82 templates loaded). The remaining "dwarves do nothing" had 5 root causes, all verified against the live 53.16-r3 binary via an API probe session:
+
+- CRITICAL `plan.lua` — `dfhack.maps.getMapSize` DOES NOT EXIST in 53.16 (it is `getTileSize`, and it returns x, y, z as THREE values, not a table). The pcall failed silently → `find_fort_entrance` returned nil → "Could not find fort entrance location" → NO rooms, NO digging, NO workshops, and `setup_done = true` meant the plan never retried. THE reason the dwarves idled.
+  - FIX: `find_fort_entrance` rewritten — anchors the fort where the original df-ai does: (1) the EMBARK WAGON building (building_wagonst; works on the user's existing save), (2) the citizen centroid (reclaims / wagon gone), (3) map-center surface scan (getTileSize, integer coords, tree-canopy skip). Zero-size maps (title screen returns 0,0,0 — and 0 is truthy in Lua) count as "no map".
+  - `Plan:plan_setup` now returns success; `setup_done` only set on success; `Plan:update` retries setup (capped at 10 attempts). Room placement, per-tag batches and corridor BFS are each pcall-isolated — one bad template can no longer kill the layout.
+- `stocks.lua:493` — `plant_raw_flags.EDIBLE_RAW` / `EDIBLE_COOKED` were REMOVED from the enum in 53.16 (BitArray named reads of missing members THROW — SEED/SPRING/GRASS/TREE/DRINK/MILL all still exist, verified). `pick_farm_plant` crashed on EVERY stocks update, aborting `update_plants` AND `unforbid_items`.
+  - FIX: flag reads gated on enum membership (`df.plant_raw_flags[name] ~= nil`), one pcall per plant. `Stocks:update` is now phase-isolated (count / needs / plants / unforbid each in their own pcall).
+- `camera.lua:57` — `dfhack.units.getPosition` returns THREE values (x, y, z); `local pos = ...` captured only the first (a number) and `pos.x` threw "attempt to index a number value" on every camera tick.
+  - FIX: 3-value capture; the camera now pans the real v50 view via `dfhack.gui.revealInDwarfmodeMap` (verified present + callable) with cursor writes as fallback. Target rotation slowed to every 1200 ticks (was: a different dwarf every tick).
+- `population.lua:402` — `unit_flags1.prisoner` and `.criminal` no longer exist in 53.16 (probe-verified; reads throw). `update_crimes` crashed every 12th population pass.
+  - FIX: one-time capability probe (`df.unit_flags1:new()` + pcall) caches whether the bits exist; justice automation no-ops cleanly when they don't (0.47 layout still supported).
+- `population.lua:365` — `historical_entity.assignments` REMOVED in 53.16; the replacement is `assignments_by_type` (vector of per-type vectors, probe-verified). `update_nobles` crashed every 12th pass.
+  - FIX: `compat.assignments()` flattens both layouts (0.47 flat vector / 53.16 by-type vectors) into a plain Lua array, fully pcall-guarded; `position_holder` uses it too.
+- `df-ai.lua` tag_enemies: same 3-value getPosition fix.
+- `population.lua` update_caged: cage-release block fully pcall-wrapped (unit.cage / removeUnit are not guaranteed on 53.16).
+
+Tests: `test/unit_fixes.lua` mocks now FAITHFULLY reproduce the live 53.16 API (no getMapSize; getTileSize/getPosition as 3-value returns; plant_raw_flags without EDIBLE_RAW; unit_flags1 without prisoner/criminal; entity.assignments throwing). 63 checks (was 32) + the CI smoke test, all green; 20/20 live checks against the real DF 53.16-r3 binary (module loads, plan deferral + 82 templates, bounded retries, justice gate, assignments flattening, camera no-op).
+
+Stage summary: every error visible in the user's r3.3 console log is fixed and live-verified; the plan pipeline (rooms → digging → workshops → orders) should now actually run for the first time on a real map.

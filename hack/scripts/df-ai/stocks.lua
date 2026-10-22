@@ -191,10 +191,18 @@ function Stocks:startup()
 end
 
 function Stocks:update()
-    self:count_stocks()
-    self:check_needs()
-    self:update_plants()
-    self:unforbid_items()
+    -- Each phase runs independently: a crash in one (e.g. an API field
+    -- removed in a future version) must not starve the others.
+    local function step(fn, what)
+        local ok, err = pcall(fn)
+        if not ok then
+            dfhack.printerr('[df-ai] stocks ' .. what .. ' failed: ' .. tostring(err))
+        end
+    end
+    step(function() self:count_stocks() end, 'count')
+    step(function() self:check_needs() end, 'needs')
+    step(function() self:update_plants() end, 'plants')
+    step(function() self:unforbid_items() end, 'unforbid')
 end
 
 -- ============================================================
@@ -478,6 +486,12 @@ end
 -- ============================================================
 
 -- Find a plant raw suitable for farming: prefer drink-producing, then food
+-- 53.16 NOTE: EDIBLE_RAW / EDIBLE_COOKED were REMOVED from the
+-- plant_raw_flags enum (reading a missing BitArray field THROWS, which
+-- used to abort every stocks update). Flag reads are gated on the enum
+-- member actually existing, and the whole per-plant read is one pcall.
+local PLANT_FLAGS = df and df.plant_raw_flags or nil
+
 function Stocks:pick_farm_plant()
     local world = df.global.world
     if not world or not world.raws then return -1 end
@@ -485,12 +499,20 @@ function Stocks:pick_farm_plant()
     if not plants then return -1 end
     local best, best_score = -1, -1
     for i, plant in ipairs(plants) do
-        if plant.flags and plant.flags.SEED and plant.flags.SPRING
-            and not plant.flags.GRASS and not plant.flags.TREE then
+        local ok_f, seed, spring, grass, tree, drink, mill, edible = pcall(function()
+            local function flag(name)
+                if not PLANT_FLAGS or PLANT_FLAGS[name] == nil then return false end
+                return plant.flags[name] == true
+            end
+            return flag('SEED'), flag('SPRING'), flag('GRASS'), flag('TREE'),
+                flag('DRINK'), flag('MILL'),
+                flag('EDIBLE_RAW') or flag('EDIBLE_COOKED')
+        end)
+        if ok_f and seed and spring and not grass and not tree then
             local score = 0
-            if plant.flags.DRINK then score = score + 3 end
-            if plant.flags.MILL then score = score + 2 end
-            if plant.flags.EDIBLE_RAW or plant.flags.EDIBLE_COOKED then score = score + 1 end
+            if drink then score = score + 3 end
+            if mill then score = score + 2 end
+            if edible then score = score + 1 end
             if score > best_score then
                 best_score = score
                 best = plant.id

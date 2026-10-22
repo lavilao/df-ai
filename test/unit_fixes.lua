@@ -8,12 +8,20 @@
 --
 -- Covered:
 --   1. Plan:find_fort_entrance  — odd map sizes (integer coords), tree
---      canopy skipped, no plotinfo.embark_pos anywhere
+--      canopy skipped, no plotinfo.embark_pos anywhere; WAGON anchor and
+--      citizen centroid fallback (r3.4); getTileSize 3-value semantics
 --   2. AI:watch_announcements   — 53.16 report layout (no flags.danger),
 --      no history replay, danger detection by type
 --   3. Embark:handle_title      — title screen state machine: Continue /
 --      Start / NewWorld, list pages, struct-throw survival
 --   4. click_frac               — coordinate scaling 160x66 -> 170x64
+--   5. Plan setup retry         — setup_done only on success, capped retries
+--   6. Stocks                   — phase-isolated update, plant_raw_flags
+--      WITHOUT EDIBLE_RAW (BitArray read must not throw)
+--   7. Camera                   — 3-value getPosition, revealInDwarfmodeMap
+--      with cursor fallback
+--   8. Population + compat      — prisoner/criminal bits gone, assignments
+--      flattened from assignments_by_type (e.assignments throws)
 --
 -- Usage: lua5.3 test/unit_fixes.lua   (from the repository root)
 
@@ -147,9 +155,15 @@ dfhack_mock.timeout = function() end
 dfhack_mock.gui = {
     getCurViewscreen = function() return cur_screen_mock end,
     getCurFocus = function() return 'title' end,
+    -- revealInDwarfmodeMap is assigned per-test (recorder or nil)
 }
 dfhack_mock.maps = {
-    getMapSize = function() return dfhack_mock.__map_size end,
+    -- Faithful to 53.16: there is NO getMapSize. getTileSize returns
+    -- x, y, z as THREE separate values (verified against the live binary).
+    getTileSize = function()
+        local ms = dfhack_mock.__map_size
+        return ms.x, ms.y, ms.z
+    end,
     getTileBlock = function(x, y, z)
         recorded_blocks[#recorded_blocks + 1] = { x = x, y = y, z = z }
         local tile = dfhack_mock.__tile_for_z[z] or 0
@@ -158,6 +172,17 @@ dfhack_mock.maps = {
                 return setmetatable({}, { __index = function() return tile end })
             end }),
         }
+    end,
+}
+-- Faithful to 53.16: getPosition returns x, y, z as THREE values (NOT a
+-- table — the r3.3 camera bug indexed the first number).
+dfhack_mock.units = {
+    isCitizen = function(u) return u.citizen == true end,
+    isAlive = function(u) return u.alive ~= false end,
+    isOwnCiv = function(u) return u.own_civ == true end,
+    getPosition = function(u)
+        if not u.pos then return nil end
+        return u.pos.x, u.pos.y, u.pos.z
     end,
 }
 dfhack_mock.run_script_with_env = function(env, name, opts)
@@ -213,10 +238,15 @@ do
     check(ok_plan, 'plan module loads')
     local p = Plan.new({ config = {} })
 
+    check(dfhack_mock.maps.getMapSize == nil,
+        'sanity: mock has NO getMapSize (53.16 does not have it — the r3.3 plan bug)')
+
     -- odd map: 97 x 99 x 5; z=4 EMPTY, z=3 TREE canopy, z=2 FLOOR
+    df_mock.global.world = nil
     dfhack_mock.__map_size = { x = 97, y = 99, z = 5 }
     dfhack_mock.__tile_for_z = { [4] = 0, [3] = 8, [2] = 1 }
 
+    recorded_blocks = {}
     local entrance = p:find_fort_entrance()
     check(entrance ~= nil, 'find_fort_entrance returns a position')
     check(entrance and entrance.x == 48 and entrance.y == 49,
@@ -237,6 +267,41 @@ do
     dfhack_mock.__tile_for_z = { [4] = 8, [3] = 8, [2] = 8, [1] = 8, [0] = 8 }
     entrance = p:find_fort_entrance()
     check(entrance ~= nil and entrance.z == 4, 'all-trees map falls back to z=top')
+
+    -- title screen: getTileSize returns 0,0,0 -> nil (0 is truthy in Lua!)
+    dfhack_mock.__map_size = { x = 0, y = 0, z = 0 }
+    entrance = p:find_fort_entrance()
+    check(entrance == nil, 'zero-size map (title screen) returns nil')
+    dfhack_mock.__map_size = { x = 97, y = 99, z = 5 }
+
+    -- the embark WAGON anchors the fort entrance (what the game places
+    -- at every new embark — the original df-ai behavior)
+    dfhack_mock.__tile_for_z = { [4] = 0, [3] = 0, [2] = 1 }
+    df_mock.global.world = {
+        buildings = {
+            all = dfvec({
+                { x1 = 0, x2 = 2, y1 = 0, y2 = 2, z = 2 }, -- not a wagon
+                { x1 = 10, x2 = 12, y1 = 20, y2 = 22, z = 2, wagon = true },
+            }),
+        },
+        units = { all = dfvec({ { id = 1, citizen = true, pos = { x = 50, y = 60, z = 2 } } }) },
+    }
+    df_mock.building_wagonst = {
+        is_instance = function(_, b) return b.wagon == true end,
+    }
+    entrance = p:find_fort_entrance()
+    check(entrance and entrance.x == 11 and entrance.y == 21 and entrance.z == 2,
+        'embark wagon anchors the entrance (11,21,2), got '
+        .. tostring(entrance and entrance.x) .. ',' .. tostring(entrance and entrance.y)
+        .. ',' .. tostring(entrance and entrance.z))
+
+    -- no wagon -> citizen centroid (reclaims, wagon deconstructed)
+    df_mock.global.world.buildings.all = dfvec({})
+    entrance = p:find_fort_entrance()
+    check(entrance and entrance.x == 50 and entrance.y == 60 and entrance.z == 2,
+        'no wagon: citizen centroid anchors the entrance (50,60,2), got '
+        .. tostring(entrance and entrance.x) .. ',' .. tostring(entrance and entrance.y)
+        .. ',' .. tostring(entrance and entrance.z))
 end
 
 -- ============================================================
@@ -439,6 +504,179 @@ do
     check(df_mock.gps.mouse_x == 92 and df_mock.gps.mouse_y == 37,
         'reference 160x66 grid reproduces the measured (92,37), got '
         .. df_mock.gps.mouse_x .. ',' .. df_mock.gps.mouse_y)
+end
+
+-- ============================================================
+-- 5. Plan setup retry (setup_done must depend on success)
+-- ============================================================
+print('--- Plan setup retry ---')
+do
+    local ok_plan2, Plan2 = pcall(dfhack_mock.run_script_with_env, nil, 'df-ai/plan', { module = true })
+    check(ok_plan2, 'plan module reloads for retry test')
+
+    -- failing setup (no plan_config): setup_done must STAY false
+    local p = Plan2.new({ config = {} })
+    p.plan_config = nil
+    p:startup()
+    check(p.setup_done == false, 'failed setup does not set setup_done')
+    check((p.setup_attempts or 0) == 1, 'failed setup counted attempt 1')
+
+    -- update retries, counter capped at 10
+    p.plan_setup = function() return false end
+    local ok_all = true
+    for _ = 1, 20 do
+        if not pcall(function() p:update() end) then ok_all = false end
+    end
+    check(ok_all, '20 plan updates with a failing setup never crash')
+    check(p.setup_attempts == 10, 'retry attempts capped at 10, got ' .. tostring(p.setup_attempts))
+    check(p.setup_done == false, 'still not done after repeated failures')
+
+    -- successful setup flips setup_done and queues the room check
+    local q = Plan2.new({ config = {} })
+    q.plan_setup = function() return true end
+    q:startup()
+    check(q.setup_done == true, 'successful setup sets setup_done')
+    local has_check = false
+    for _, t in ipairs(q.tasks_generic) do
+        if t.type == 'check_rooms' then has_check = true end
+    end
+    check(has_check, 'check_rooms task queued after successful setup')
+end
+
+-- ============================================================
+-- 6. Stocks: phase-isolated update + 53.16 plant flags
+-- ============================================================
+print('--- Stocks: update isolation + farm plant flags ---')
+do
+    -- faithful 53.16 plant_raw_flags: NO EDIBLE_RAW / EDIBLE_COOKED
+    df_mock.plant_raw_flags = {
+        SEED = 5, SPRING = 0, SUMMER = 1, AUTUMN = 2, WINTER = 3,
+        GRASS = 79, TREE = 78, DRINK = 7, MILL = 13,
+    }
+    local ok_st, Stocks = pcall(dfhack_mock.run_script_with_env, nil, 'df-ai/stocks', { module = true })
+    check(ok_st, 'stocks module loads with 53.16 plant flags')
+
+    local s = Stocks.new({})
+    local ran = {}
+    s.count_stocks = function() error('boom') end
+    s.check_needs = function() ran.needs = true end
+    s.update_plants = function() ran.plants = true end
+    s.unforbid_items = function() ran.unforbid = true end
+    local ok_u = pcall(function() s:update() end)
+    check(ok_u, 'stocks update survives a crashing phase')
+    check(ran.needs and ran.plants and ran.unforbid,
+        'remaining phases still run after a phase crash')
+
+    -- pick_farm_plant: BitArray that THROWS on EDIBLE_RAW (the r3.3 crash)
+    local throwing_flags = setmetatable(
+        { SEED = true, SPRING = true, GRASS = false, TREE = false, DRINK = true, MILL = false },
+        { __index = function() error('Cannot read field BitArray<>.EDIBLE_RAW: not found.') end })
+    df_mock.global.world = {
+        raws = { plants = { all = dfvec({
+            { id = 42, flags = throwing_flags },
+            { id = 43, flags = { SEED = false, SPRING = true } },
+        }) } },
+    }
+    local ok_pfp, plant_id = pcall(function() return s:pick_farm_plant() end)
+    check(ok_pfp, 'pick_farm_plant survives the removed EDIBLE_RAW enum member')
+    check(ok_pfp and plant_id == 42,
+        'drink plant still chosen (id 42), got ' .. tostring(plant_id))
+end
+
+-- ============================================================
+-- 7. Camera: 3-value getPosition + v50 view panning
+-- ============================================================
+print('--- Camera: 3-value getPosition + v50 view ---')
+do
+    local ok_cam, Camera = pcall(dfhack_mock.run_script_with_env, nil, 'df-ai/camera', { module = true })
+    check(ok_cam, 'camera module loads')
+    local c = Camera.new({ config = { camera = true } })
+    c.ai = { config = { camera = true } }
+    c:startup()
+    check(c.enabled, 'camera enabled from config')
+
+    df_mock.global.world = {
+        units = { all = dfvec({ { id = 7, citizen = true, alive = true, pos = { x = 11, y = 22, z = 3 } } }) },
+    }
+    df_mock.unit = {
+        find = function(id)
+            if id == 7 then return { id = 7, alive = true, pos = { x = 11, y = 22, z = 3 } } end
+            return nil
+        end,
+    }
+    df_mock.global.cursor = make_struct({ x = 0, y = 0, z = 0 }, {})
+
+    local revealed = {}
+    dfhack_mock.gui.revealInDwarfmodeMap = function(pos, hl, zoom)
+        revealed[#revealed + 1] = { pos = pos, hl = hl, zoom = zoom }
+    end
+
+    local ok_c1 = pcall(function() c:update() end)
+    check(ok_c1, 'camera update does not crash (r3.3 threw on pos.x)')
+    check(#revealed == 1 and revealed[1].pos.x == 11
+        and revealed[1].pos.y == 22 and revealed[1].pos.z == 3,
+        'camera pans the v50 view to the followed dwarf')
+    check(df_mock.global.cursor.x == 0 and df_mock.global.cursor.y == 0,
+        'reveal path used, cursor not scribbled')
+
+    -- reveal missing -> falls back to cursor writes without crashing
+    dfhack_mock.gui.revealInDwarfmodeMap = nil
+    local ok_c2 = pcall(function() c:update() end)
+    check(ok_c2, 'camera update survives a missing reveal API')
+    check(df_mock.global.cursor.x == 11 and df_mock.global.cursor.z == 3,
+        'cursor fallback wrote the followed dwarf position')
+end
+
+-- ============================================================
+-- 8. Population justice gate + compat assignments flattening
+-- ============================================================
+print('--- Population: justice gate + assignments_by_type ---')
+do
+    -- faithful 53.16 unit_flags1: prisoner/criminal REMOVED (reads throw)
+    df_mock.unit_flags1 = {
+        new = function()
+            return make_struct({ delete = function() end },
+                { prisoner = true, criminal = true })
+        end,
+    }
+    local ok_pop, Population = pcall(dfhack_mock.run_script_with_env, nil, 'df-ai/population', { module = true })
+    check(ok_pop, 'population module loads with 53.16 flags')
+
+    local pop = Population.new({ config = { manage_nobles = true } })
+    pop.ai = { config = { manage_nobles = true }, plan = nil }
+    df_mock.global.world = { units = { all = dfvec({ { id = 1, flags1 = {} } }) } }
+
+    local ok_cr = pcall(function() pop:update_crimes() end)
+    check(ok_cr, 'update_crimes no-ops safely without prisoner/criminal bits')
+    local ok_cr2 = pcall(function() pop:update_crimes() end)
+    check(ok_cr2, 'second call uses the cached probe (no crash)')
+
+    -- nobles: entity with 53.16 assignments_by_type (e.assignments THROWS)
+    local entity = make_struct({
+        assignments_by_type = dfvec({
+            dfvec({ { histfig = 5, position_id = 1 }, { histfig = -1, position_id = 2 } }),
+            dfvec({ { histfig = 7, position_id = 3 } }),
+        }),
+    }, { assignments = true }) -- e.assignments must throw (53.16 removed it)
+
+    local saved_plotinfo = df_mock.global.plotinfo
+    df_mock.global.plotinfo = make_struct(
+        { main = { fortress_entity = entity } }, { embark_pos = true })
+    df_mock.historical_figure = { find = function(hid) return { unit_id = 100 + hid } end }
+
+    local ok_cx, Cx = pcall(dfhack_mock.run_script_with_env, nil, 'df-ai/compat', { module = true })
+    check(ok_cx, 'compat module loads')
+    local ok_a, flat = pcall(function() return Cx.assignments() end)
+    check(ok_a and type(flat) == 'table' and #flat == 3,
+        'assignments_by_type flattened to 3 entries (got ' .. tostring(ok_a and #flat) .. ')')
+
+    pop.ai.plan = { getbedroom = function() return { room = true } end }
+    local ok_nb = pcall(function() pop:update_nobles() end)
+    check(ok_nb, 'update_nobles survives the removed .assignments field')
+    check(pop.noble_rooms[105] and pop.noble_rooms[107],
+        'noble bedrooms assigned via flattened assignments (units 105, 107)')
+
+    df_mock.global.plotinfo = saved_plotinfo
 end
 
 -- ============================================================

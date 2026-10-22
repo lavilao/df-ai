@@ -323,12 +323,38 @@ function compat.fort_entity_id()
 end
 
 -- Fortress position assignments (broker, bookkeeper, ...)
+-- 53.16 REMOVED historical_entity.assignments; the assignments now live
+-- in assignments_by_type (a vector of per-position-type vectors). Reading
+-- a field that does not exist THROWS in the DFHack wrapper, so both
+-- layouts are probed with pcall and flattened into a plain Lua array.
 function compat.assignments()
     local e = compat.fort_entity()
-    if e and e.assignments then
-        return e.assignments
+    if not e then return {} end
+    local out = {}
+
+    -- 0.47 layout: flat vector
+    local ok_flat, flat = pcall(function() return e.assignments end)
+    if ok_flat and flat then
+        for _, a in ipairs(flat) do out[#out + 1] = a end
+        return out
     end
-    return nil
+
+    -- 53.16 layout: vector of per-type vectors
+    local ok_bt, by_type = pcall(function() return e.assignments_by_type end)
+    if ok_bt and by_type then
+        for _, vec in ipairs(by_type) do
+            local ok_v = pcall(function()
+                for _, a in ipairs(vec) do out[#out + 1] = a end
+            end)
+            if not ok_v then
+                -- not a nested vector — maybe an assignment directly
+                pcall(function()
+                    if vec.histfig then out[#out + 1] = vec end
+                end)
+            end
+        end
+    end
+    return out
 end
 
 -- Find the holder unit id of a fortress position by code ('BROKER', ...)
@@ -336,11 +362,11 @@ end
 function compat.position_holder(code)
     local e = compat.fort_entity()
     if not e then return -1 end
-    local positions = e.positions and e.positions.own
-    if not positions then return -1 end
+    local ok_pos, positions = pcall(function() return e.positions and e.positions.own end)
+    if not ok_pos or not positions then return -1 end
     for _, pos in ipairs(positions) do
         if pos.code == code then
-            for _, assign in ipairs(e.assignments or {}) do
+            for _, assign in ipairs(compat.assignments()) do
                 if assign.position_id == pos.id and assign.histfig >= 0 then
                     -- histfig -> historical figure; resolve to unit
                     local histfig = df.historical_figure.find(assign.histfig)

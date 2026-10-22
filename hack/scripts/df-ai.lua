@@ -344,8 +344,12 @@ function AI:tag_enemies()
     for _, unit in ipairs(units) do
         -- v50: use DFHack's own-civ check (fort civ is not a simple field anymore)
         if not dfhack.units.isOwnCiv(unit) and dfhack.units.isAlive(unit) then
-            local pos = dfhack.units.getPosition(unit)
-            if pos then
+            -- 53.16: getPosition returns x, y, z as THREE values — only the
+            -- first is needed here as an "on the map" check
+            local ok_p, x = pcall(function()
+                return dfhack.units.getPosition(unit)
+            end)
+            if ok_p and x then
                 -- Follow hostiles if camera is enabled (old df-ai "tagged"
                 -- units internally; the 53.16 port tracks them via camera)
                 if self.camera and self.camera.enabled then
