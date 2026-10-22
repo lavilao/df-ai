@@ -190,3 +190,29 @@ Stage Summary:
 - Critical fortress-start bug FIXED + verified (persistence test green).
 - Auto-embark shipped: full pre-fortress automation with instruction fallbacks.
 - Pending real-display verification: AI in-fortress behavior (digging/rooms) — needs the user's test or a fortress save; headless blocked at the Embark button only.
+
+## Session 7 — r3.3: fortress-start crash + title-screen root causes fixed (user report: "No funciona / no eligió continue playing")
+
+User's live log on a real 1366x768 display (170x64 grid) exposed three root causes:
+
+- CRASH (why dwarves did nothing): `plan.lua:290` read `plotinfo.embark_pos` — a 0.47 field REMOVED in v50. Reading a struct field that does not exist THROWS in the DFHack Lua wrapper (it does not return nil), and the pcall was wrapped around the wrong expression. That single read aborted ALL of `AI:startup()` — no repeating tasks, no unpause, no stocks/camera.
+  - FIX: `find_fort_entrance()` rewritten — v50 has no embark_pos; the entrance is the surface at the CENTER of the local map (what generic01 is designed around). Integer coords (odd maps produced x.5 tile indices), tree-canopy skip via tile-shape filtering, always returns a position.
+  - HARDENING: every module starts inside its own `safe()` (pcall + report) — one broken module can never kill the chain again. All repeat-util callbacks pcall-wrapped. Background task queue processes each task under pcall (a throwing task is dropped, not fatal).
+
+- ROOT CAUSE of "no eligió Continue Playing" (three stacked bugs):
+  1. `ipairs` over DFHack vectors is 0-BASED (live-verified: first iteration yields i=0). The menu code did `idx0 = i - 1` → `selected = -1` → nothing highlighted → SELECT was a no-op. Same off-by-one broke `custom_workshop_index` (raws) and `watch_announcements` (loop started at `#announcements`, which is nil → instant break, reports never examined).
+  2. v50 title-menu buttons are MOUSE-ONLY: `selected` + `simulateInput('SELECT')` does NOTHING (live-verified). A gps-injected click (`gps.mouse_x/y` + `simulateInput('_MOUSE_L')`, the hide-tutorials technique) WORKS — live-verified title → worldgen transition.
+  3. Menu layout measured on both 1280x800 and the user's 1366x768: items are top-anchored, first item at ~55.3% height, spacing EXACTLY 3 grid rows at any resolution. Fixed 160x66 grid coordinates missed every button on a 170x64 display — all coordinates are now fractions/row-based and scale.
+  - NEW `handle_title`: full state machine over `title_mode_type` (MAIN_MENU / CONTINUE_INACTIVE / CONTINUE_ACTIVE_WORLD / CONTINUE_ACTIVE), detects fort saves/worlds from the MENU CONTENTS (the savegame_header_* vectors are EMPTY at the main menu — live-verified), prefers loading an existing fort (config `embark_continue_fort`, default true), clicks the right button per mode, caches the goal across page changes, retries with caps, never blind-clicks near save-delete buttons.
+- watch_announcements rewritten for 53.16: report.flags is announcement_flag {continuation, unconscious, announcement, high_prio_removal} — the old 0.47 danger/attack bits would THROW every 10 ticks. Danger now detected by announcement TYPE name; only reports newer than the newest already seen trigger tag_enemies (no history replay on fort reload).
+- suppress_tutorial: removed the bogus `plotinfo.flags.need_to_do_tutorial` read (field does not exist; the throw silently aborted the rest of the suppression).
+- handle_new_region now CREATES THE WORLD automatically (welcome-popup Okay click, then [Create world] click — clicks only; stray SELECT keys open the abort prompt and stall worldgen).
+- choose_game_type / setup screens: candidate-position cycling + retry caps (no `selected` field exists on those screens in 53.16 — verified against df-structures).
+- dismiss_popups(): closes v50 "You have arrived"-style modal popups over the map for a few seconds after startup.
+- Site scoring fixed: live debugging showed `region_map_entry.temperature` reads 0-100 on the 53.16 binary (75 = temperate), NOT the documented Urist scale — the Urist math turned every good tile into -1681. Dual-scale handling now; scan-time field values logged next to re-read values in the console message (score went -1681 → -35 on the same world; picks a real forest). One settle poll before scanning.
+- test/unit_fixes.lua added (32 checks): find_fort_entrance on odd maps, 53.16 announcement layout, title state machine incl. struct-throw survival (mocks reproduce DFHack's throw-on-missing-field behavior and 0-based vector ipairs), click coordinate scaling. Runs in CI alongside ci_smoke.
+
+Live E2E at the user's EXACT resolution (1366x768, 170x64 grid), world save present:
+title(Start clicked) → world list(first world clicked) → adopt_region(auto-loads) → choose_game_type(Fortress clicked) → site screen(quick start + scored site, score -35) — the entire pre-embark chain now runs hands-free. Remaining known limitation: the final green [Embark] button ignores ALL synthetic input in the headless Xvfb environment (gps AND real X11 clicks — re-verified); the console prints a manual-click instruction as fallback. Real displays are expected to behave (every other button did).
+
+Stage summary: fortress AI startup unblocked; Continue Playing auto-flow implemented and click-calibrated; worldgen automated; announcement watcher un-crashed; CI extended with unit tests.

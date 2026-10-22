@@ -75,6 +75,20 @@ local function click_grid(gx, gy)
     return pcall(gui.simulateInput, s, '_MOUSE_L')
 end
 
+-- All button positions were measured on a 160x66 grid (1280x800 windowed)
+-- and are stored as FRACTIONS of the screen so they scale to any grid
+-- size. A 1366x768 display runs a 170x64 grid — fixed grid coordinates
+-- miss every button there.
+local function click_frac(fx, fy)
+    local dimx, dimy = 160, 66
+    pcall(function()
+        dimx = df.global.gps.dimx or 160
+        dimy = df.global.gps.dimy or 66
+    end)
+    if dimx < 40 or dimy < 20 then dimx, dimy = 160, 66 end
+    return click_grid(math.floor(fx * dimx + 0.5), math.floor(fy * dimy + 0.5))
+end
+
 function Embark.new(ai)
     local o = {
         ai = ai,
@@ -83,6 +97,7 @@ function Embark.new(ai)
         announced_site = false,
     }
     setmetatable(o, Embark)
+    o:reset()
     return o
 end
 
@@ -90,6 +105,16 @@ end
 function Embark:reset()
     self.handled = {}
     self.announced_site = false
+    self.title_tries = 0
+    self.gt_tries = 0
+    self.su_tries = 0
+    self.last_title_mode = nil
+    self.want_continue = nil
+    self.site_settle = nil
+    self.guided_title = false
+    self.guided_title_list = false
+    self.guided_gametype = false
+    self.guided_setup = false
 end
 
 -- ============================================================
@@ -117,22 +142,18 @@ function Embark:suppress_tutorial()
             end
         end
 
-        if pi.flags and pi.flags.need_to_do_tutorial then
-            pi.flags.need_to_do_tutorial = false
-        end
-
         if help and help.open then
             -- skip the embark tutorial prompt the way hide-tutorials does:
             -- switch to the plain message context and click its button
             local scr = dfhack.gui.getCurViewscreen(true)
-            local mouse_y = 23
+            local fy = 0.348 -- row 23 on the 160x66 reference grid
             if help.context == df.help_context_type.EMBARK_TUTORIAL_CHOICE then
                 help.context = df.help_context_type.EMBARK_MESSAGE
-                mouse_y = 18
+                fy = 0.273 -- row 18 on the reference grid
             end
             if help.context == df.help_context_type.EMBARK_MESSAGE and scr then
                 df.global.gps.mouse_x = df.global.gps.dimx // 2
-                df.global.gps.mouse_y = mouse_y
+                df.global.gps.mouse_y = math.floor(fy * df.global.gps.dimy + 0.5)
                 pcall(gui.simulateInput, scr, '_MOUSE_L')
             end
             help.open = false
@@ -192,38 +213,56 @@ function Embark:score_sites()
         for y = 2, h - 2, step do
             local e = region_entry(wd.region_map, x, y)
             if e then
-                samples = samples + 1
-                local score = 0
-                local elev = e.elevation or 0
-                -- land (not ocean/lake <100, not mountain 150+)
-                if elev < 100 then score = score - 1000
-                elseif elev >= 150 then score = score - 120 end
-                -- evil: 0-32 good, 33-65 neutral, 66+ evil
-                local evil = e.evilness or 50
-                if evil >= 66 then score = score - 800 end
-                score = score - evil * 2
-                -- savagery: 0-32 calm, 33-65 neutral, 66+ savage
-                local sav = e.savagery or 50
-                if sav >= 66 then score = score - 500 end
-                score = score - sav * 2
-                -- temperature in Urist (10000 = 0 C): prefer temperate
-                local t = e.temperature or 10000
-                if t < 9900 then score = score - 400 end      -- freezing
-                if t > 11000 then score = score - 400 end      -- scorching
-                local tdist = math.abs(t - 10400)
-                score = score - tdist / 8
-                -- vegetation: want trees (beds!)
-                local veg = e.vegetation or 0
-                if veg < 10 then score = score - 300 end
-                score = score + veg * 2
-                -- salinity: prefer fresh (coastal salt = no drinking)
-                local sal = e.salinity or 0
-                if sal >= 66 then score = score - 100 end
-                -- slight preference for variety of elevation nearby:
-                -- flat-but-not-too-flat is nice; skip (needs neighbors)
-                if score > best_score then
-                    best_score = score
-                    best = { x = x, y = y, score = score, entry = e }
+                -- one bad tile read must not abort the whole scan
+                local ok, score, f1, f2, f3, f4, f5 = pcall(function()
+                    local s = 0
+                    -- elevation (df-structures): 0-99 = ocean, 100-149 =
+                    -- all other biomes (land), 150+ = mountains
+                    local elev = tonumber(e.elevation) or 0
+                    if elev < 100 then s = s - 1200
+                    elseif elev >= 200 then s = s - 300
+                    elseif elev >= 150 then s = s - 120 end
+                    -- evil: 0-32 good, 33-65 neutral, 66+ evil
+                    local evil = tonumber(e.evilness) or 50
+                    if evil >= 66 then s = s - 800 end
+                    s = s - evil * 2
+                    -- savagery: 0-32 calm, 33-65 neutral, 66+ savage
+                    local sav = tonumber(e.savagery) or 50
+                    if sav >= 66 then s = s - 500 end
+                    s = s - sav * 2
+                    -- temperature: df-structures says Urist (10000 = 0 C),
+                    -- but the live 53.16 binary reads 0-100 (75 = temperate
+                    -- on a pocket island) — handle BOTH scales
+                    local t = tonumber(e.temperature) or 60
+                    if t > 5000 then
+                        if t < 9900 then s = s - 400 end   -- freezing
+                        if t > 11000 then s = s - 400 end   -- scorching
+                        s = s - math.abs(t - 10400) / 8
+                    else
+                        if t < 25 then s = s - 400 end      -- freezing
+                        if t > 85 then s = s - 400 end      -- scorching
+                        s = s - math.abs(t - 60) * 3
+                    end
+                    -- vegetation: want trees (beds!)
+                    local veg = tonumber(e.vegetation) or 0
+                    if veg < 10 then s = s - 300 end
+                    s = s + veg * 2
+                    -- salinity: prefer fresh (coastal salt = no drinking)
+                    local sal = tonumber(e.salinity) or 0
+                    if sal >= 66 then s = s - 100 end
+                    return s, elev, evil, sav, veg, t
+                end)
+                if ok then
+                    samples = samples + 1
+                    if score > best_score then
+                        best_score = score
+                        -- keep the scan-time field values: the region map
+                        -- can be repopulated by the site screen AFTER the
+                        -- scan, so re-reading best.entry later may differ
+                        best = { x = x, y = y, score = score, entry = e,
+                            scan_elev = f1, scan_evil = f2, scan_sav = f3,
+                            scan_veg = f4, scan_temp = f5 }
+                    end
                 end
             end
         end
@@ -251,7 +290,7 @@ function Embark:select_site(screen)
     local ly = math.floor((16 - dy) / 2)
     local rx, ry = best.x, best.y
 
-    local ok = pcall(function()
+    local ok, werr = pcall(function()
         screen.location.region_pos.x = rx
         screen.location.region_pos.y = ry
         screen.location.embark_pos_min.x = rx * 16 + lx
@@ -264,13 +303,23 @@ function Embark:select_site(screen)
         screen.zoom_cent_y = ry * 16 + 8
     end)
     if not ok then
-        dbg('select_site: write failed: ' .. tostring(plan_err))
+        dbg('select_site: write failed: ' .. tostring(werr))
         say('failed to write embark location — pick a site manually')
         return false
     end
 
-    say(string.format('site selected: region (%d, %d), %dx%d, score %.0f (of %d tiles scanned)',
-        rx, ry, dx, dy, best.score, best.samples or 0))
+    -- log the raw tile values too — if the flat-array indexing ever drifts,
+    -- the user's console report shows it immediately
+    local raw = ''
+    pcall(function()
+        raw = string.format(' [scan: elev %s evil %s sav %s veg %s temp %s | reread: %s %s %s %s]',
+            tostring(best.scan_elev), tostring(best.scan_evil), tostring(best.scan_sav),
+            tostring(best.scan_veg), tostring(best.scan_temp),
+            tostring(best.entry.elevation), tostring(best.entry.evilness),
+            tostring(best.entry.savagery), tostring(best.entry.vegetation))
+    end)
+    say(string.format('site selected: region (%d, %d), %dx%d, score %.0f%s (of %d tiles scanned)',
+        rx, ry, dx, dy, best.score, raw, best.samples or 0))
     return true
 end
 
@@ -279,41 +328,152 @@ end
 -- ============================================================
 
 function Embark:handle_title(screen)
-    if self.handled.title then return end
-    self.handled.title = true
     self:suppress_tutorial()
 
-    -- With an existing world save, the v50 title screen opens directly in
-    -- the "Continue Playing" world list. Entering a world leads to the
-    -- game-type selection, which is what we want.
-    local n_worlds = 0
-    pcall(function() n_worlds = #(screen.savegame_header_world or {}) end)
-    if n_worlds > 0 then
-        say('existing world found — selecting it to start playing')
-        -- the first row is highlighted by default; SELECT/Enter loads it
-        send_keys('SELECT')
-        say("if nothing happened, click the world in the 'Continue playing' list")
-        return
+    -- 53.16 title screen state machine (df-structures: viewscreen_titlest):
+    --   mode: MAIN_MENU | CONTINUE_INACTIVE (Start->world list)
+    --       | CONTINUE_ACTIVE_WORLD (Continue->world list)
+    --       | CONTINUE_ACTIVE (Continue->save list) | ABOUT
+    --   menu_line_id: vector<main_choice_type> shown on the main menu
+    --   selected: index (0-based) into the current menu/list
+    local M = df.title_mode_type
+    local mode = screen.mode
+
+    -- reset the retry counter whenever the title screen changes page
+    if self.last_title_mode ~= mode then
+        self.last_title_mode = mode
+        self.title_tries = 0
+    end
+    self.title_tries = self.title_tries + 1
+
+    -- Detect what the menu OFFERS. NOTE: the savegame_header_* vectors are
+    -- EMPTY while on the main menu (they are populated only inside the
+    -- lists — verified live), so the menu items themselves are the signal:
+    --   "Continue" present -> fort saves exist
+    --   "Start" present    -> worlds exist (but no fort saves)
+    local function menu_has(choice)
+        local found = false
+        pcall(function()
+            for _, v in ipairs(screen.menu_line_id) do
+                if v == choice then found = true end
+            end
+        end)
+        return found
     end
 
-    -- No world: the main menu. Choose "Create new world".
-    local want = nil
-    local ok_items = pcall(function()
-        for i, v in ipairs(screen.menu_line_id or {}) do
-            if v == df.main_choice_type.NewWorld then
-                want = i
+    if mode == M.MAIN_MENU then
+        -- (re)compute and CACHE the goal: in the list modes menu_line_id
+        -- may be stale/empty, so the decision must not depend on it there
+        local has_continue = menu_has(df.main_choice_type.Continue)
+        self.want_continue = has_continue
+            and (not self.ai or not self.ai.config
+                or self.ai.config.embark_continue_fort ~= false)
+    end
+    local want_continue
+    if self.want_continue ~= nil then
+        want_continue = self.want_continue
+    else
+        -- never saw the main menu this run: infer the goal from the list
+        -- we are already in (Start-world list = new-fortress flow)
+        want_continue = (mode ~= M.CONTINUE_INACTIVE)
+    end
+
+    if mode == M.MAIN_MENU then
+        local choice
+        if want_continue then
+            choice = df.main_choice_type.Continue
+        elseif menu_has(df.main_choice_type.Start) then
+            choice = df.main_choice_type.Start
+        else
+            choice = df.main_choice_type.NewWorld
+        end
+
+        -- find the menu item and highlight it. NOTE: ipairs over a DFHack
+        -- vector is 0-BASED (verified live: first iteration yields i=0) —
+        -- i IS the 0-based menu index; do not subtract 1 (the old i-1 set
+        -- selected=-1, which is why "Continue Playing" was never picked)
+        local idx0 = nil
+        pcall(function()
+            for i, v in ipairs(screen.menu_line_id) do
+                if v == choice then idx0 = i end
+            end
+        end)
+
+        if self.title_tries == 1 then
+            if choice == df.main_choice_type.Continue then
+                say('existing fort save found — selecting "Continue Playing"')
+            elseif choice == df.main_choice_type.Start then
+                say('existing world found — selecting "Start Playing"')
+            else
+                say('no saves found — selecting "Create New World"')
             end
         end
-    end)
-    if not ok_items or not want then
-        say("at the title screen — select 'Create new world' to begin the auto-embark flow")
+
+        if idx0 then
+            -- v50 title buttons are MOUSE-driven: selected+SELECT alone does
+            -- NOTHING (verified live on 53.16), but a gps-injected click at
+            -- the button works. Measured layout (calibrated on BOTH
+            -- 1280x800/160x66 and 1366x768/170x64):
+            --   menu items are top-anchored, first item's button at ~55.3%
+            --   of the screen height, spacing EXACTLY 3 grid rows at any
+            --   resolution (35.8px @66 rows, 36px @64 rows). There is no
+            --   big banner: Continue/Start is simply item 0.
+            local dimx, dimy = 160, 66
+            pcall(function()
+                dimx = df.global.gps.dimx or 160
+                dimy = df.global.gps.dimy or 66
+            end)
+            if dimx < 40 or dimy < 20 then dimx, dimy = 160, 66 end
+            local gy = math.floor(0.553 * dimy + 0.5) + 3 * idx0
+            click_grid(math.floor(0.494 * dimx + 0.5), gy)
+            -- key/state channel kept as backup (harmless if ignored)
+            pcall(function() screen.selected = idx0 end)
+            send_keys('SELECT')
+        end
+        if self.title_tries >= 10 and not self.guided_title then
+            self.guided_title = true
+            say("if the menu did not move, click 'Continue Playing' / 'Start Playing' / 'Create New World' yourself")
+        end
         return
     end
 
-    say('title menu: selecting "Create new world"')
-    pcall(function() screen.selected = want - 1 end) -- 0-based
-    send_keys('SELECT')
-    say('if nothing happened, click "Create new world" on the menu')
+    if mode == M.CONTINUE_INACTIVE or mode == M.CONTINUE_ACTIVE_WORLD
+        or mode == M.CONTINUE_ACTIVE then
+        -- a save/world list page of the title screen
+        local ok_mode = (want_continue and mode ~= M.CONTINUE_INACTIVE)
+            or (not want_continue and mode == M.CONTINUE_INACTIVE)
+        if not ok_mode then
+            -- wrong list for our goal: back out to the main menu
+            send_keys('LEAVESCREEN')
+            return
+        end
+        if self.title_tries == 1 then
+            if mode == M.CONTINUE_INACTIVE then
+                say('world list — selecting the first world')
+            elseif mode == M.CONTINUE_ACTIVE_WORLD then
+                say('world list — selecting the first world')
+            else
+                say('save list — selecting the first (most recent) save')
+            end
+        end
+        -- key/state channel first…
+        pcall(function() screen.selected = 0 end)
+        pcall(function() screen.selected_r = 0 end)
+        send_keys('SELECT')
+        -- …plus a click on the first row. Measured on the world list at
+        -- 1366x768: the first entry's text spans 421-443px (~55-57% of the
+        -- height); cycle nearby candidates per poll. x=0.494 is the center
+        -- column, clear of the right-edge delete buttons.
+        local rows = { 0.522, 0.5625, 0.6025 }
+        click_frac(0.494, rows[((self.title_tries - 1) % #rows) + 1])
+        if self.title_tries >= 10 and not self.guided_title_list then
+            self.guided_title_list = true
+            say('if nothing happened, click the first entry in the list yourself')
+        end
+        return
+    end
+
+    -- ABOUT / other pages: nothing to do
 end
 
 function Embark:handle_new_region(screen)
@@ -345,7 +505,7 @@ function Embark:handle_new_region(screen)
         if self.handled.play_now then return end
         self.handled.play_now = true
         say('world generated — going for quick start (Play now!)')
-        click_grid(8, 22)   -- [Play now!] (bottom-left of the report)
+        click_frac(0.050, 0.333) -- [Play now!] (bottom-left of the report)
         send_keys('SELECT')
         say('if nothing happened, click [Play now!] (bottom left of the worldgen report)')
         return
@@ -364,22 +524,37 @@ function Embark:handle_new_region(screen)
         return -- generating; nothing to do
     end
 
-    -- params screen (-1/0). Do NOT inject keys here: a stray SELECT during
-    -- generation start opens the abort prompt and stalls worldgen. Also,
-    -- writing simple_* params does not stick (the screen re-syncs them
-    -- from the selected worldgen preset), so we just guide the user.
+    -- params screen (-1/0). CLICKS ONLY (a stray SELECT key here opens the
+    -- abort prompt and stalls worldgen — verified in earlier sessions).
+    -- First the welcome popup [Okay], then [Create world] with the default
+    -- worldgen params (writing simple_* params does not stick; the screen
+    -- re-syncs them from the selected preset).
     if not self.handled.nr_announced then
         self.handled.nr_announced = true
-        say('worldgen screen ready — dismiss the welcome popup (if any) and click [Create world]')
+        say('worldgen screen — creating a world (default params)')
+        local function try_create()
+            local st = -1
+            pcall(function()
+                st = df.global.world.worldgen_status.state or -1
+            end)
+            -- never click [Create world] once generation has started
+            if st < 1 then click_frac(0.661, 0.941) end
+        end
+        click_frac(0.501, 0.386) -- welcome popup [Okay] (harmless if absent)
+        dfhack.timeout(15, 'frames', function() click_frac(0.501, 0.386) end)
+        dfhack.timeout(40, 'frames', try_create) -- [Create world]
+        dfhack.timeout(90, 'frames', try_create) -- retry if the first was eaten
     end
 end
 
 function Embark:handle_game_type(screen)
-    if self.handled.game_type then return end
-    self.handled.game_type = true
     self:suppress_tutorial()
 
-    -- Fortress is gametype DWARF_MAIN; find it and select it
+    self.gt_tries = (self.gt_tries or 0) + 1
+
+    -- Fortress is gametype DWARF_MAIN. NOTE: this screen has NO 'selected'
+    -- field in 53.16 (verified against df-structures) — selection is made
+    -- by clicking the Fortress box or pressing SELECT.
     local idx = nil
     pcall(function()
         for i, gt in ipairs(screen.gametypes or {}) do
@@ -387,14 +562,27 @@ function Embark:handle_game_type(screen)
         end
     end)
     if not idx then
-        say("choose 'Dwarf Fortress' mode to continue the auto-embark flow")
+        if self.gt_tries == 1 then
+            say("choose 'Dwarf Fortress' mode to continue the auto-embark flow")
+        end
         return
     end
-    say('game type: Fortress')
-    pcall(function() screen.selected = idx - 1 end)
-    click_grid(79, 23)  -- the Fortress box (roughly centered)
+    if self.gt_tries == 1 then
+        say('game type: Fortress')
+    end
+    -- cycle candidate positions for the Fortress box across polls (the
+    -- box position varies with layout; 0.358 is the 1280x800 measurement)
+    local candidates = {
+        { 0.494, 0.358 }, { 0.494, 0.310 }, { 0.494, 0.405 },
+        { 0.494, 0.445 }, { 0.494, 0.265 },
+    }
+    local c = candidates[((self.gt_tries - 1) % #candidates) + 1]
+    click_frac(c[1], c[2])
     send_keys('SELECT')
-    say("if nothing happened, click the 'Dwarf Fortress' box")
+    if self.gt_tries >= 10 and not self.guided_gametype then
+        self.guided_gametype = true
+        say("if nothing happened, click the 'Dwarf Fortress' box")
+    end
 end
 
 function Embark:handle_site(screen)
@@ -414,11 +602,11 @@ function Embark:handle_site(screen)
             self.handled.quick_start = true
             say('quick start: letting the game pick a forested mineral-rich site')
             -- [Start tutorial / quick start] button of the choice dialog
-            -- (grid 92,37 on a 160x66 grid — the yellow hotkey marker)
-            click_grid(92, 37)
-            dfhack.timeout(10, 'frames', function() click_grid(92, 37) end)
-            dfhack.timeout(30, 'frames', function() click_grid(92, 37) end)
-            dfhack.timeout(80, 'frames', function() click_grid(92, 37) end)
+            -- (57.5%, 56.1% of the screen on the reference grid)
+            click_frac(0.575, 0.561)
+            dfhack.timeout(10, 'frames', function() click_frac(0.575, 0.561) end)
+            dfhack.timeout(30, 'frames', function() click_frac(0.575, 0.561) end)
+            dfhack.timeout(80, 'frames', function() click_frac(0.575, 0.561) end)
             return
         end
         if not help_open and not self.handled.quick_start then
@@ -437,6 +625,15 @@ function Embark:handle_site(screen)
 
     -- select a scored site (idempotent: only announces once)
     if not self.announced_site then
+        -- let the site screen settle for one poll first: scanning the
+        -- region map immediately after entry read STALE values (live
+        -- debugging showed tiles flipping from ocean to land after the
+        -- screen finished loading — score -1681 for a tile that reads
+        -- elevation 146 a moment later)
+        if not self.site_settle then
+            self.site_settle = true
+            return
+        end
         self.announced_site = true
         self:select_site(screen)
         -- The game shows an [Abort] button (instead of [Embark]) until a
@@ -456,8 +653,8 @@ function Embark:handle_site(screen)
         say('embark rectangle placed — pressing Embark')
         -- after the drag the [Embark] button appears; click it a few
         -- frames later (give the game a moment to process the selection)
-        dfhack.timeout(15, 'frames', function() click_grid(113, 63) end)
-        dfhack.timeout(40, 'frames', function() click_grid(113, 63) end)
+        dfhack.timeout(15, 'frames', function() click_frac(0.706, 0.955) end)
+        dfhack.timeout(40, 'frames', function() click_frac(0.706, 0.955) end)
         say('press the green [Embark] button (bottom right) if the screen did not advance')
         return
     end
@@ -472,15 +669,29 @@ function Embark:handle_site(screen)
 end
 
 function Embark:handle_setup(screen)
-    if self.handled.setup then return end
-    self.handled.setup = true
     self:suppress_tutorial()
 
-    say('dwarf setup screen — going for [Play Now!]')
-    -- initial_selection: 0 = Play Now, 1 = Prepare carefully
-    pcall(function() screen.initial_selection = 0 end)
+    self.su_tries = (self.su_tries or 0) + 1
+
+    -- NOTE: 53.16's viewscreen_setupdwarfgamest has no 'initial_selection'
+    -- field (verified against df-structures). Try a spread of likely
+    -- [Play Now!] button positions + SELECT, and tell the user what to do
+    -- if none of them land.
+    if self.su_tries == 1 then
+        say('dwarf setup screen — going for [Play Now!]')
+    end
+    -- candidate positions (screen fractions), one per poll
+    local candidates = {
+        { 0.125, 0.500 }, { 0.125, 0.115 }, { 0.125, 0.885 },
+        { 0.500, 0.925 }, { 0.125, 0.300 }, { 0.125, 0.700 },
+    }
+    local c = candidates[((self.su_tries - 1) % #candidates) + 1]
+    click_frac(c[1], c[2])
     send_keys('SELECT')
-    say("if nothing happened, click [Play Now!] on the left")
+    if self.su_tries >= #candidates and not self.guided_setup then
+        self.guided_setup = true
+        say("if nothing happened, click [Play Now!] yourself — the AI takes over when the map loads")
+    end
 end
 
 -- ============================================================

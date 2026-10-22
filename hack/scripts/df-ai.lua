@@ -13,6 +13,17 @@ local function debug_log(...)
     dfhack.println('[df-ai] ', ...)
 end
 
+-- run fn, print errors instead of letting them abort the caller. Used for
+-- per-module startup so ONE broken module cannot kill the whole AI (that
+-- is exactly what plotinfo.embark_pos did in plan.lua).
+local function safe(fn, what)
+    local ok, err = pcall(fn)
+    if not ok then
+        dfhack.printerr('[df-ai] ' .. tostring(what) .. ' failed: ' .. tostring(err))
+    end
+    return ok
+end
+
 local function load_config()
     local ok, config = pcall(json.decode_file, 'dfhack-config/df-ai.json')
     if not ok or not config then
@@ -29,6 +40,8 @@ local function default_config()
     return {
         random_embark = true,
         embark_mode = 'quick',
+        -- prefer loading an existing fort save over starting a new fortress
+        embark_continue_fort = true,
         random_embark_world = '',
         write_console = true,
         write_log = true,
@@ -133,17 +146,19 @@ function AI:startup()
     if not self.plan or not self.population then
         self:load_modules()
     end
-    if self.population then self.population:startup() end
+    -- each module starts INDEPENDENTLY: one broken module must not abort
+    -- the whole chain again (repeating tasks + unpause always get to run)
+    if self.population then safe(function() self.population:startup() end, 'population startup') end
     if self.plan then
-        self.plan:startup()
+        safe(function() self.plan:startup() end, 'plan startup')
         -- kick the first plan update immediately so digging starts ASAP
-        local ok, err = pcall(function() self.plan:update() end)
-        if not ok then debug_log('first plan update failed: ' .. tostring(err)) end
+        safe(function() self.plan:update() end, 'first plan update')
     end
-    if self.stocks then self.stocks:startup() end
-    if self.camera then self.camera:startup() end
-    self:register_repeating_tasks()
-    self:unpause()
+    if self.stocks then safe(function() self.stocks:startup() end, 'stocks startup') end
+    if self.camera then safe(function() self.camera:startup() end, 'camera startup') end
+    safe(function() self:register_repeating_tasks() end, 'repeating tasks')
+    safe(function() self:unpause() end, 'unpause')
+    safe(function() self:dismiss_popups() end, 'popup dismiss')
 end
 
 function AI:shutdown()
@@ -198,31 +213,50 @@ end
 function AI:register_repeating_tasks()
     if self.plan then
         repeatutil.scheduleEvery(GLOBAL_KEY .. '-plan', 25, 'ticks', function()
-            if self.plan then self.plan:update() end
+            if self.plan then safe(function() self.plan:update() end, 'plan update') end
         end)
     end
     if self.population then
         repeatutil.scheduleEvery(GLOBAL_KEY .. '-pop', 25, 'ticks', function()
-            if self.population then self.population:update() end
+            if self.population then safe(function() self.population:update() end, 'population update') end
         end)
         repeatutil.scheduleEvery(GLOBAL_KEY .. '-pop-deathwatch', 1, 'ticks', function()
-            if self.population then self.population:deathwatch() end
+            if self.population then safe(function() self.population:deathwatch() end, 'population deathwatch') end
         end)
     end
     if self.stocks then
         repeatutil.scheduleEvery(GLOBAL_KEY .. '-stocks', 50, 'ticks', function()
-            if self.stocks then self.stocks:update() end
+            if self.stocks then safe(function() self.stocks:update() end, 'stocks update') end
         end)
     end
     if self.camera then
         repeatutil.scheduleEvery(GLOBAL_KEY .. '-camera', 5, 'ticks', function()
-            if self.camera then self.camera:update() end
+            if self.camera then safe(function() self.camera:update() end, 'camera update') end
         end)
     end
     -- Announcement watcher
     repeatutil.scheduleEvery(GLOBAL_KEY .. '-announce', 10, 'ticks', function()
-        self:watch_announcements()
+        safe(function() self:watch_announcements() end, 'announcements')
     end)
+end
+
+-- v50 shows modal popups over the map on load (e.g. "You have arrived",
+-- tutorial prompts). They pause/block the game; dismiss whatever sits on
+-- top of the map for a few seconds after startup.
+function AI:dismiss_popups()
+    local tries = 0
+    local function dismiss()
+        tries = tries + 1
+        if tries > 6 then return end
+        local ok, view = pcall(function() return dfhack.gui.getCurViewscreen(true) end)
+        if ok and view and not df.viewscreen_dwarfmodest:is_instance(view) then
+            local gui = require('gui')
+            pcall(gui.simulateInput, view, 'LEAVESCREEN')
+            pcall(gui.simulateInput, view, 'SELECT')
+            dfhack.timeout(25, 'frames', dismiss)
+        end
+    end
+    dfhack.timeout(40, 'frames', dismiss)
 end
 
 function AI:unpause()
@@ -238,21 +272,66 @@ function AI:abandon()
     dfhack.run_command('die')
 end
 
+-- 53.16: report.flags is announcement_flag {continuation, unconscious,
+-- announcement, high_prio_removal} — the old 0.47 danger/attack bits no
+-- longer exist (reading them THROWS). Danger is detected from the
+-- announcement TYPE instead.
+function AI:is_danger_announcement(ann)
+    if not self.danger_announcements then
+        self.danger_announcements = {}
+        local ok = pcall(function()
+            for name, val in pairs(df.announcement_type) do
+                if type(name) == 'string' and type(val) == 'number' then
+                    local n = name:lower()
+                    if n:find('siege') or n:find('ambush') or n:find('invad')
+                        or n:find('thief') or n:find('snatcher')
+                        or n:find('megabeast') or n:find('titan')
+                        or n:find('forgotten') or n:find('demon')
+                        or n:find('attack') or n:find('hostile') then
+                        self.danger_announcements[val] = true
+                    end
+                end
+            end
+        end)
+        if not ok then self.danger_announcements = {} end
+    end
+    local ok, t = pcall(function() return ann.type end)
+    return ok and self.danger_announcements[tonumber(t)] == true
+end
+
 function AI:watch_announcements()
     local world = df.global.world
     if not world or not world.status then return end
     local announcements = world.status.announcements
-    if not announcements then return end
+    if not announcements or #announcements == 0 then return end
 
-    for _, ann in ipairs(announcements) do
-        if ann.flags and (ann.flags.danger or ann.flags.attack) then
-            -- Mark hostile creatures nearby
-            self:tag_enemies()
-            if ann.type then
-                local type_name = tostring(ann.type) or 'unknown'
-                debug_log('Danger: ' .. type_name)
-            end
+    -- only react to reports newer than the newest one already seen, so a
+    -- long-lived fort does not replay its entire history on AI start
+    if not self.last_report_id then
+        local ok, nid = pcall(function() return world.status.next_report_id end)
+        self.last_report_id = (ok and nid and nid > 0) and (nid - 1) or 0
+    end
+
+    local danger = false
+    local newest = self.last_report_id
+    -- DFHack vectors are 0-BASED: valid indices are 0..#announcements-1
+    -- (the old loop started at #announcements, which is nil, and broke out
+    -- immediately without ever examining a report)
+    for i = #announcements - 1, 0, -1 do
+        local ann = announcements[i]
+        local ok, aid = pcall(function() return ann.id end)
+        if not ok or not aid then break end
+        if aid <= self.last_report_id then break end
+        if aid > newest then newest = aid end
+        if self:is_danger_announcement(ann) then
+            danger = true
+            local okn, name = pcall(function() return tostring(ann.type) end)
+            debug_log('danger report: ' .. (okn and name or 'unknown'))
         end
+    end
+    self.last_report_id = newest
+    if danger then
+        safe(function() self:tag_enemies() end, 'tag_enemies')
     end
 end
 
@@ -368,14 +447,6 @@ function isEnabled()
     return ai_enabled
 end
 
-local function safe(fn, what)
-    local ok, err = pcall(fn)
-    if not ok then
-        dfhack.printerr('[df-ai] ' .. what .. ' failed: ' .. tostring(err))
-    end
-    return ok
-end
-
 local function print_status()
     if the_ai then
         print(the_ai:status())
@@ -385,7 +456,7 @@ local function print_status()
 end
 
 local function print_version()
-    print('df-ai Lua rewrite for DF 53.16 (DFHack 53.16-r3)')
+    print('df-ai Lua rewrite for DF 53.16 (DFHack 53.16-r3) — build r3.3')
     print('Based on BenLubar/df-ai')
 end
 

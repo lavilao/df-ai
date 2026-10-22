@@ -283,34 +283,58 @@ function Plan:plan_setup()
     dfhack.println('[df-ai] Setup complete: ' .. #self.rooms .. ' rooms, ' .. #self.corridors .. ' corridors')
 end
 
-function Plan:find_fort_entrance()
-    -- Try to find the embark position from plotinfo
-    local ok, plotinfo = pcall(function() return df.global.plotinfo end)
-    if ok and plotinfo then
-        local pos = plotinfo.embark_pos
-        if pos then
-            return { x = pos.x, y = pos.y, z = pos.z }
+-- Ground shapes for the surface scan. Enum-table lookups are plain table
+-- indexing (a missing name yields nil, no throw) — unlike struct FIELD
+-- reads, which throw on anything that does not exist in 53.16.
+local GROUND_SHAPES
+local function is_ground_shape(shape)
+    if not GROUND_SHAPES then
+        GROUND_SHAPES = {}
+        for _, name in ipairs({ 'FLOOR', 'WALL', 'RAMP', 'STAIR_UP',
+            'STAIR_DOWN', 'STAIR_UPDOWN', 'BROOK_TOP' }) do
+            local v = df.tiletype_shape[name]
+            if v ~= nil then GROUND_SHAPES[v] = true end
         end
     end
+    return GROUND_SHAPES[shape] == true
+end
 
-    -- Fallback: find surface at map center
-    local maps = dfhack.maps
-    if not maps then return nil end
+function Plan:find_fort_entrance()
+    -- v50 REMOVED plotinfo.embark_pos entirely, and reading a struct field
+    -- that does not exist THROWS in the DFHack Lua wrapper — that single
+    -- read is what crashed AI startup ("startup failed: ...embark_pos:
+    -- not found") and left the dwarves doing nothing. The original df-ai
+    -- places the fort entrance at the CENTER of the local map on the
+    -- surface, which is what the generic01 plan is designed around.
+    local ok_s, size = pcall(function() return dfhack.maps.getMapSize() end)
+    if not ok_s or not size or not size.x or not size.y or not size.z then
+        return nil
+    end
+    -- integer coordinates: getMapSize().x / 2 produces x.5 on odd maps and
+    -- non-integer tile indices throw
+    local center_x = math.floor((size.x - 1) / 2)
+    local center_y = math.floor((size.y - 1) / 2)
 
-    local center_x = maps.getMapSize().x / 2
-    local center_y = maps.getMapSize().y / 2
-
-    for z = maps.getMapSize().z - 1, 0, -1 do
-        local block = maps.getTileBlock(center_x, center_y, z)
-        if block then
-            local tile = block.tiletype[center_x % 16][center_y % 16]
-            local tt = df.tiletype.attrs[tile]
-            if tt and tt.shape ~= df.tiletype_shape.EMPTY then
-                return { x = center_x, y = center_y, z = z }
+    -- walk down from the top of the map at the center tile until solid
+    -- ground is found (skips trees, shrubs, and open air)
+    for z = size.z - 1, 0, -1 do
+        local ok_b, block = pcall(dfhack.maps.getTileBlock, center_x, center_y, z)
+        if ok_b and block then
+            local ok_t, tile = pcall(function()
+                return block.tiletype[center_x % 16][center_y % 16]
+            end)
+            if ok_t and tile then
+                local ok_a, shape = pcall(function()
+                    return df.tiletype.attrs[tile].shape
+                end)
+                if ok_a and is_ground_shape(shape) then
+                    return { x = center_x, y = center_y, z = z }
+                end
             end
         end
     end
-    return nil
+    -- last resort: top of the map (a plan anchored in a tree beats no plan)
+    return { x = center_x, y = center_y, z = size.z - 1 }
 end
 
 function Plan:_place_start(entrance)
@@ -763,6 +787,8 @@ function Plan:start_processing_generic()
             local reason = ''
             local del = false
 
+            -- one throwing task must not kill the background queue
+            local ok, err = pcall(function()
             if t.type == TASK_TYPE.want_dig then
                 local wantdig_max = 2
                 if t.room and t.room:is_dug() then
@@ -845,6 +871,12 @@ function Plan:start_processing_generic()
                     del = true
                 end
             end
+            end)
+
+            if not ok then
+                dfhack.printerr('[df-ai] task "' .. tostring(t.type) .. '" failed: ' .. tostring(err))
+                del = true -- drop the broken task, keep the queue moving
+            end
 
             t.last_status = reason
             self_ref.bg_idx_generic = self_ref.bg_idx_generic + 1
@@ -866,10 +898,15 @@ function Plan:start_processing_furniture()
                 self_ref.bg_idx_furniture = self_ref.bg_idx_furniture + 1
                 return
             end
-            if t.type == TASK_TYPE.furnish then
-                if t.room and t.furniture then
-                    self_ref:try_furnish(t.room, t.furniture)
+            local ok, err = pcall(function()
+                if t.type == TASK_TYPE.furnish then
+                    if t.room and t.furniture then
+                        self_ref:try_furnish(t.room, t.furniture)
+                    end
                 end
+            end)
+            if not ok then
+                dfhack.printerr('[df-ai] furnish task failed: ' .. tostring(err))
             end
             self_ref.bg_idx_furniture = self_ref.bg_idx_furniture + 1
         end
@@ -1194,9 +1231,11 @@ end
 local function custom_workshop_index(code)
     local raws = df.global.world.raws
     if not raws or not raws.buildings then return -1 end
+    -- raws.buildings.all is a DFHack vector: ipairs is 0-based, so i IS
+    -- the raw index (the old i-1 returned the wrong custom workshop)
     for i, def in ipairs(raws.buildings.all) do
         if def.code == code then
-            return i - 1
+            return i
         end
     end
     return -1

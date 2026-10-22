@@ -52,6 +52,9 @@ jobs:
       - name: Module-load smoke test (mock DFHack API)
         run: lua5.3 test/ci_smoke.lua
 
+      - name: Unit tests (r3.3 fixes: entrance, announcements, title state machine)
+        run: lua5.3 test/unit_fixes.lua
+
       - name: Validate JSON data (plans, room templates, schemas)
         run: |
           python3 - <<'EOF'
