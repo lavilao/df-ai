@@ -140,3 +140,24 @@ Stage Summary:
 - Tag v53.16-r3.1 pushed -> triggers CI -> publishes installable release df-ai-53.16-r3.zip.
 - User testing path: GitHub Releases -> download zip -> extract into DF folder -> enable df-ai -> load/embark fortress on real display.
 - Known follow-ups: 'tag' command used in tag_enemies may not exist in stock DFHack 53.16 (verify); embark module not wired into runtime loop (auto-embark off by design for now); in-fortress behavior is the testing focus.
+
+---
+Task ID: 6
+Agent: main (Z.ai)
+Task: Session 5 — push to GitHub + CI release verification
+
+Work Log:
+- Root cause of the previous push failure found: the token embedded in the git remote URL was CORRUPTED at clone time (95 chars vs the real 93 — 2 stray characters). The repo is public, so git never validated those credentials during fetch; only push exposed the 401. The user's actual token was valid all along.
+- Fixed remote URL with the correct token; API check: login=lavilao, push=True.
+- Pushed branch lua-53.16-r3 (commit 6c3ba18) and tag v53.16-r3.1 to origin.
+- GitHub Action "Build df-ai package" ran twice, both SUCCESS:
+  * run #1 (branch push): lua5.3 syntax check, ci_smoke (11/11 modules), JSON validation, packaging — artifact uploaded.
+  * run #2 (tag push): same + release job published the GitHub Release.
+- Release live: https://github.com/lavilao/df-ai/releases/tag/v53.16-r3.1
+  * assets: df-ai-53.16-r3.zip (101 KB), df-ai-53.16-r3.tar.gz (48 KB)
+- Note: repo also has 3 stale failed runs (#13-15) from an old workflow_dispatch workflow ("Build and Release df-ai Plugin") that predates this port — not related.
+
+Stage Summary:
+- Delivery pipeline complete: push -> CI validate -> release with installable zip.
+- User testing path: Releases -> download zip -> extract into DF folder (contains hack/ + df-ai-blueprints/) -> launch DF+DFHack -> "enable df-ai" -> embark/load fortress.
+- Feedback wanted from real-display testing: console output after map load (expect "[df-ai] AI starting up" + "Loaded plan config + 82 templates"), room digging behavior, any Lua errors.
