@@ -96,6 +96,8 @@ jobs:
 
           # Docs
           cp INSTALL.md LICENSE README.md "dist/$PKG/" 2>/dev/null || true
+          mkdir -p "dist/$PKG/docs" 2>/dev/null || true
+          cp docs/*.md "dist/$PKG/docs/" 2>/dev/null || true
 
           echo "Package contents:"
           find "dist/$PKG" -type f | sort | sed "s|^dist/||"
