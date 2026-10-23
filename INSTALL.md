@@ -14,6 +14,7 @@
    ├── hack/scripts/df-ai/          (10 módulos .lua)
    ├── df-ai-blueprints/plans/      (generic01.json)
    ├── df-ai-blueprints/templates/  (82 plantillas de salas)
+│   └── df-ai-blueprints/instances/ (instancias: talleres/almacenes tipados)
    └── ...
    ```
 3. Arranca el juego con DFHack 53.16-r3 (Steam: simplemente lanzar el juego;
@@ -78,6 +79,7 @@ cp -r hack/scripts/df-ai.lua hack/scripts/df-ai "<DF dir>/hack/scripts/"
 mkdir -p "<DF dir>/df-ai-blueprints"
 cp -r plans "<DF dir>/df-ai-blueprints/plans"
 cp -r rooms/templates "<DF dir>/df-ai-blueprints/templates"
+cp -r rooms/instances "<DF dir>/df-ai-blueprints/instances"
 ```
 
 > You can also drop the whole repo folder inside your DF folder and symlink
@@ -160,3 +162,16 @@ internals, `ui` → `plotinfo`, etc.), so the port is a ground-up Lua rewrite
 on DFHack's first-class Lua plugin API. The old C++ sources remain in the
 repo for reference. See `MIGRATION_TO_50.md` and `WORKLOG.md` for the full
 analysis.
+
+
+## r3.7 notes
+
+- The blueprint placement engine + 67 priority rules are active: the fort
+  now GROWS from the entrance (rooms anchor to live exits, accesspath
+  recursion digs parents first). See `docs/INFORME_ESTRATEGIAS.md` for the
+  full strategy report (Spanish).
+- df-ai now enables stock DFHack automation: autochop, seedwatch,
+  autoclothing (each toggleable in `dfhack-config/df-ai.json`, set
+  `dfhack_tools` to `false` to disable all).
+- `df-ai help` prints the full command list; the script header now shows
+  a description in the DFHack in-game menu.

@@ -233,6 +233,7 @@ function room.new(room_type, min, max, kwargs)
         stock_specific2 = false,
         has_users = 0,
         furnished = false,
+        queue_dig = kwargs.queue_dig or false,
         temporary = kwargs.temporary or false,
         outdoor = kwargs.outdoor or false,
         channeled = kwargs.channeled or false,

@@ -132,7 +132,8 @@ package.loaded['json'] = {
 
 local modules = {
     'df-ai/compat', 'df-ai/config', 'df-ai/uihelp', 'df-ai/camera',
-    'df-ai/embark', 'df-ai/rooms', 'df-ai/plan', 'df-ai/population',
+    'df-ai/embark', 'df-ai/rooms', 'df-ai/blueprint', 'df-ai/priorities',
+    'df-ai/plan', 'df-ai/population',
     'df-ai/stocks', 'df-ai/trade',
 }
 

@@ -1,3 +1,18 @@
+-- df-ai: automatic fortress manager (Dwarf Fortress AI)
+--
+-- Lua port of BenLubar/df-ai for DF 53.16 + DFHack 53.16-r3.
+-- Automates the whole fortress: auto-embark, blueprint-based room
+-- placement and digging, workshops, stockpiles, furniture, defense
+-- traps, manager orders, labor management and camera control.
+--
+-- Usage::
+--
+--   enable df-ai            start the AI (works from the title screen)
+--   disable df-ai           stop it
+--   df-ai status            fortress + AI state summary
+--   df-ai help              full command list
+--   df-ai version           build information
+--
 --@enable = true
 --@module = true
 
@@ -47,6 +62,13 @@ local function default_config()
         write_log = true,
         record_movie = false,
         no_quit = true,
+        -- r3.7: delegate repetitive automation to the stock DFHack
+        -- tools instead of re-implementing them (each can be disabled
+        -- individually; set dfhack_tools = false to disable all)
+        dfhack_tools = true,
+        dfhack_tools_autochop = true,      -- tree cutting
+        dfhack_tools_seedwatch = true,     -- keep seeds for replanting
+        dfhack_tools_autoclothing = true,  -- clothing production
         embark_options = {
             DimensionX = 3,
             DimensionY = 2,
@@ -170,6 +192,36 @@ function AI:startup()
                     .. ' — will engage in a loaded fortress')
             end
         end, 'enable labor management')
+    end
+    -- r3.7: DFHack stock automation tools. The C++ df-ai implemented
+    -- tree cutting, seed saving and gem cutting inside stocks.cpp;
+    -- DFHack ships battle-tested implementations of all of them, so
+    -- we enable those and spend the porting effort on strategy
+    -- instead. Every tool is pcall-guarded: a missing tool logs and
+    -- moves on (distro builds may differ).
+    if self.config.dfhack_tools ~= false then
+        local tools = {
+            { 'autochop', self.config.dfhack_tools_autochop ~= false,
+                'enable autochop' },
+            { 'seedwatch', self.config.dfhack_tools_seedwatch ~= false,
+                'enable seedwatch' },
+            -- NOTE: autogems does not exist in DFHack 53.16-r3 (live-
+            -- verified in the arena); gem cutting stays with stocks.lua
+            { 'autoclothing', self.config.dfhack_tools_autoclothing ~= false,
+                'enable autoclothing' },
+        }
+        for _, t in ipairs(tools) do
+            local name, wanted, cmd = t[1], t[2], t[3]
+            if wanted then
+                safe(function()
+                    dfhack.run_command(cmd)
+                    if name == 'seedwatch' then
+                        -- keep 25 seeds of every plant for replanting
+                        dfhack.run_command('seedwatch all 25')
+                    end
+                end, 'enable ' .. name)
+            end
+        end
     end
     -- each module starts INDEPENDENTLY: one broken module must not abort
     -- the whole chain again (repeating tasks + unpause always get to run)
@@ -604,8 +656,34 @@ local function print_status()
 end
 
 local function print_version()
-    print('df-ai Lua rewrite for DF 53.16 (DFHack 53.16-r3) — build r3.3')
+    print('df-ai Lua rewrite for DF 53.16 (DFHack 53.16-r3) — build r3.7')
     print('Based on BenLubar/df-ai')
+end
+
+local function print_help()
+    print [[df-ai — automatic fortress manager (port of BenLubar/df-ai)
+
+Usage:
+  enable df-ai              Start the AI. Safe to run at the DF title
+                            screen: it auto-embarks (or loads your
+                            latest fort save) and takes over from there.
+  disable df-ai             Stop the AI (designations/buildings stay).
+  df-ai status              Citizens, military, rooms, tasks, watched
+                            items, priority rules in progress.
+  df-ai report              Write a full JSON report to df-ai-report.json.
+  df-ai embark              Manually trigger one auto-embark attempt.
+  df-ai version             Build information.
+
+Config file: dfhack-config/df-ai.json
+  manage_labors             'autolabor' (default) | 'labormanager' | ''
+  dfhack_tools              true — enable bundled DFHack automation
+                            (autochop, seedwatch, autogems, autoclothing;
+                            each has its own dfhack_tools_<name> key)
+  embark_continue_fort      true — prefer loading your latest fort save
+  camera                    true — camera follows interesting events
+
+Blueprints: df-ai-blueprints/ must sit inside your DF directory
+(plans/, templates/, instances/).]]
 end
 
 local function handle_command(args)
@@ -617,6 +695,8 @@ local function handle_command(args)
     local cmd = args[1]
     if cmd == 'version' then
         print_version()
+    elseif cmd == 'help' or cmd == '?' then
+        print_help()
     elseif cmd == 'status' then
         print_status()
     elseif cmd == 'embark' then
@@ -648,7 +728,7 @@ local function handle_command(args)
         print('df-ai option disabled: ' .. sub)
     else
         print('Unknown command: ' .. cmd)
-        print('Available: version, status, report, abandon, embark, enable <opt>, disable <opt>')
+        print('Available: status, help, version, report, embark, abandon, enable <opt>, disable <opt>')
     end
 end
 

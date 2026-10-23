@@ -55,6 +55,9 @@ jobs:
       - name: Unit tests (r3.3 fixes - entrance, announcements, title state machine)
         run: lua5.3 test/unit_fixes.lua
 
+      - name: Blueprint engine tests (headless placement + priorities)
+        run: lua5.3 test/test_blueprint_engine.lua
+
       - name: Validate JSON data (plans, room templates, schemas)
         run: |
           python3 - <<'EOF'
@@ -85,8 +88,11 @@ jobs:
           cp -r hack/scripts/df-ai.lua hack/scripts/df-ai "dist/$PKG/hack/scripts/"
 
           # Fortress blueprints -> df-ai-blueprints/ at the DF root
+          # (r3.7: instances/ added — the blueprint engine merges
+          # templates x instances to get typed workshops/stockpiles)
           cp -r plans "dist/$PKG/df-ai-blueprints/plans"
           cp -r rooms/templates "dist/$PKG/df-ai-blueprints/templates"
+          cp -r rooms/instances "dist/$PKG/df-ai-blueprints/instances"
 
           # Docs
           cp INSTALL.md LICENSE README.md "dist/$PKG/" 2>/dev/null || true

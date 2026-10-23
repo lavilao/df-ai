@@ -548,16 +548,35 @@ do
     check(p.setup_attempts == 10, 'retry attempts capped at 10, got ' .. tostring(p.setup_attempts))
     check(p.setup_done == false, 'still not done after repeated failures')
 
-    -- successful setup flips setup_done and queues the room check
+    -- r3.7: setup is ASYNC. plan_setup() starts a resumable placement
+    -- builder; setup_done + the check_rooms/check_idle tasks appear
+    -- only when the builder completes (Plan:_finish_setup).
     local q = Plan2.new({ config = {} })
     q.plan_setup = function() return true end
     q:startup()
-    check(q.setup_done == true, 'successful setup sets setup_done')
-    local has_check = false
+    check(q.builder_started == true, 'successful setup starts the builder')
+    check(q.setup_done == false, 'setup_done waits for builder completion')
+    -- simulate the builder finishing on the next update
+    q.builder = {
+        done = false,
+        step = function(self) self.done = true end,
+        result = function(self)
+            local rm = { type = 'corridor', min = {x=0,y=0,z=0}, max = {x=1,y=1,z=0},
+                layout = {}, accesspath = {}, owner = -1, squad_id = -1, queue = 0,
+                status = 'plan', pos = function() return {x=0,y=0,z=0} end,
+                distance_to = function() return 0 end }
+            return true, { rm }, { rm }, rm, { placed = 1, tries = 1 }
+        end,
+    }
+    q:update()
+    check(q.setup_done == true, 'builder completion sets setup_done')
+    local has_check, has_idle = false, false
     for _, t in ipairs(q.tasks_generic) do
         if t.type == 'check_rooms' then has_check = true end
+        if t.type == 'check_idle' then has_idle = true end
     end
     check(has_check, 'check_rooms task queued after successful setup')
+    check(has_idle, 'check_idle task queued (persistent, C++ parity)')
 end
 
 -- ============================================================
@@ -791,9 +810,11 @@ do
     p.ai = { stocks = { count_total = { pick = 5 } } }
     check(p:_wantdig_max() == 5, 'wantdig_max = max(stock picks, 2) -> 5')
 
-    -- a throwing task must not wedge the queue (r3.4 semantics kept)
+    -- a throwing task must not wedge the queue (r3.4 semantics kept).
+    -- r3.7: the room must be in status 'plan' for want_dig to act on
+    -- it at all, and check_idle is now PERSISTENT (never deleted).
     local p2 = Plan.new({}); p2.setup_done = true
-    local boom_room = { queue = 0, is_dug = function() error('task boom') end }
+    local boom_room = { queue = 0, status = 'plan', is_dug = function() error('task boom') end }
     p2.tasks_generic = {
         { type = 'want_dig', room = boom_room },
         { type = 'check_idle' },
@@ -808,8 +829,9 @@ do
     dfhack_mock.printerr = old_perr
     check(#err_seen >= 1 and err_seen[1]:find('task boom', 1, true),
         'the throwing task was reported, not swallowed')
-    check(#p2.tasks_generic == 0,
-        'broken task dropped, queue kept moving (0 tasks left)')
+    check(#p2.tasks_generic == 1 and p2.tasks_generic[1].type == 'check_idle',
+        'broken task dropped; persistent check_idle survived ('
+        .. #p2.tasks_generic .. ' tasks left)')
 end
 
 print('--- r3.5: stocks act() furniture routing + print rate limit ---')

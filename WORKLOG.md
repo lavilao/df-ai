@@ -258,3 +258,35 @@ All 30+ `compat.furniture` job names verified one-by-one against the live binary
 Tests: unit_fixes.lua 92 checks (was 63), all green — new r3.5 sections cover distance_to (plain/room/nil), update-driven queues (advance without any viewscreen change, drain gate at 240 ticks, check_rooms recurrence, throwing-task isolation, wantdig_max parity), act() routing (BED/DOOR/COFFIN/QUERN/TRACTION_BENCH → queue_furniture; block → ConstructBlocks; stepladder → MakeTool) and the rate-limited print. Live probe on the real DF 53.16-r3 binary: 52/52 checks (module loads, plant_raw.id is a string, farmplotst.plant_id numeric, create_order end-to-end with insert/erase on world.manager_orders, job-name existence, Plan title-screen deferral, act() live routing, 82 templates).
 
 Stage summary: with the queues alive, the full chain now runs: check_rooms → initial_phase → want_dig → digroom → dig_room (designations!) → construct_room (workshops/stockpiles/farmplots) → check_furnish → try_furnish; stocks simultaneously feeds the manager real furniture orders. First true fort-phase release — needs the user's real-map validation.
+
+---
+
+## Session 11 — r3.7: C++ strategy port (blueprint engine + priorities) + trap-loop fix
+
+User report: fort works but "not very intelligent" vs the C++ original; dwarves stuck in a cage-trap placement loop; requests: (1) analyze the original C++ strategies/blueprints and report, (2) consider integrating stock DFHack automation tools, (3) add help text for the in-game menu.
+
+### Root causes found (vs C++ sources)
+
+1. **Cage-trap infinite loop (r3.6 log, bld 1→120)**: `try_furnish` created buildings with NO item filters — DF created the building, found the construction job unfulfillable (a cage trap needs a mechanism), deleted the building, and `checkroom`'s tantrum recovery re-placed it forever. Compounded by: `add_task` not deduplicating (C++ dedups on type+room+furniture+item_id), `construct_room` re-queueing EVERY furniture on every call, no tile-occupancy check, no wall-excavated check.
+2. **The "dumb" layout**: `_place_room_tag` was DEAD CODE (iterated rule objects as tags; `limits[tag]` always nil) — only the 13-room start template was ever placed. The C++ intelligence (exit-anchored growth + 67 priority rules) was not ported at all.
+3. **Unreachable rooms (r3.5/r3.6 leftovers)**: `accesspath` stored raw template indexes; `digroom` never recursed parents first (C++ `Plan::digroom` digs the whole accesspath chain). `check_idle` task was deleted on first run instead of persisting.
+4. **Status regression**: the `want_dig` handler called `digroom()` whenever `is_dug()` was true, resetting rooms already advanced to 'dug' by `checkroom` (duplicate "room DUG" + duplicate construct_room in the log).
+
+### Ported in r3.7 (full C++ parity for these systems)
+
+- **blueprint.lua** (new, ~1260 lines): template×instance cartesian merge with placeholder patches + index remapping; build_cache's four collision sets (corridor/interior/no_room/no_corridor, Channel/Ramp z-poisoning, exit exclusion); `can_add_room` rock-ring viability (bbox+1 ring + z+1 water-only, outdoor floor/grass checks, dig-furniture above-cavern check); 3-phase growth (start near the wagon → outdoor random tiles → connect on random live exits with tag expansion); `remove_unused_rooms` fixpoint; `handle_stairs_special`; `count_as` bookkeeping; relaxed fallback (strict fails → skip rock validation; the C++ abandoned the fort instead); resumable via coroutine (yields every 250 tries; the C++ spread setup across ticks with a progress screen).
+- **priorities.lua** (new): full rule engine — room filters (status/type/subtypes/level/outdoor/queue_dig/furnished/has_owner/workshop sub-filters/accesspath+layout count filters), count gates with between-semantics, 7 actions (dig, dig_immediate, unignore_furniture, finish, past_initial_phase, deconstruct_wagons, start_ore_search), `continue` + working/match_task latching, queue-0 blocking.
+- **plan.lua**: async setup (builder coroutine stepped from Plan:update, ~750 tries/call); add_task dedup; wantdig (queue codes); digroom with accesspath recursion + linked-stockpile digs + furnish queueing; furnish_room; want_dig handler no longer regresses status; check_idle PERSISTENT; construct_room only queues unbuilt furniture; try_furnish rebuilt (occupancy check, wall-excavated check, per-type job_item filters — TRAPPARTS for traps/levers/gears, item types for furniture, tool_use probed safely — retry caps with gave_up flags); _find_building safe id lookup; stockpile contents via bld.settings.flags; getbedroom 3-tier (digs a fresh bedroom on demand); checkrooms build_when_accessible; construct-task failure cap (10).
+- **df-ai.lua**: script header description (in-game menu), `df-ai help`, DFHack tools integration (autochop, seedwatch `all 25`, autoclothing — pcall-guarded, config-gated; autogems does not exist in 53.16-r3, removed).
+- **Packaging**: instances/ added to the release zip + CI runs the new test.
+
+### Verification
+
+- Headless (new `test/test_blueprint_engine.lua`, real JSON + simulated 96×96×16 rock world): 227 variants merged (carpenter+wood-pile instance checks), full build → **895 rooms** (200 corridors, 225 stockpiles, 115 workshops, 18 furnaces, 107 farmplots, 30 bedrooms, 10 cemeteries, 3 jails, 3 infirmaries, 8 locations…), accesspath all room-references + no cycles, workshop enums numeric, furniture absolute in-bounds (cistern floodgates ±2 by design), stairwell present, rule 0 fires dig_immediate on the food stockpile + latches, add_task dedup.
+- Unit tests: 92→97 checks green after updating to the async-setup semantics (setup_done waits for the builder; check_idle persists).
+- Live arena E2E (rock-filled arena for strict placement): entrance (23,23,5); strict-mode start placement; rule 0 firing (`dig_room_immediate stockpile/food`); accesspath recursion (staircase dug before rooms); 49 dig designations; instant-dig emulation advanced rooms through DUG→constructing→FINISHED; **56 cage traps all at UNIQUE positions** (the r3.6 loop had 7+ per tile); trap-with-TRAPPARTS-filter creates a real pending job; tools enable correctly (deferred until fort loads); manager orders 46; heartbeat stable, no spam, no error loops.
+- Menu calibration: title menu rows changed vs earlier sessions (a world exists now): NewWorld=441, TestingArena=478, Settings=514, AboutDF=549, Quit=585 at 1280×800.
+
+### Known gaps (documented in docs/INFORME_ESTRATEGIAS.md §9.2)
+
+Workshops construct without material selection (C++ picks blocks→boulder→wood; construct-cap prevents loops); df.tool_use does not exist in 53.16 (nest boxes/hives/pedestals/bookcases get no filter → skipped after capped retries); makeroom extents + try_endfurnish post-build config, cistern/well system, stocks population-scaled quotas + Watch tier, military, nobles, cemetery coffins — next milestones.
