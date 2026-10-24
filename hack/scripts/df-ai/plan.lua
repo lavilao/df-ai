@@ -608,11 +608,11 @@ end
 -- constructions, no furnishing, no manager-driven work.
 --
 -- The C++ original (plan_task.cpp) processes both queues from
--- Plan::update, which the event manager calls every 240 ticks: when a
+-- Plan::update, which the event manager calls every 1000 ticks: when a
 -- queue is drained, the next update restarts it from the top, and a
 -- per-frame once-callback walks one task per frame until drained
 -- again. This port processes a bounded batch per Plan:update call
--- (the AI wires plan updates every 25 ticks) with the same 240-tick
+-- (the AI wires plan updates every 25 ticks) with the same 1000-tick
 -- restart cadence.
 -- ============================================================
 
@@ -867,7 +867,7 @@ end
 
 -- Walk a task queue. `which` is 'generic' or 'furniture'. Processes at
 -- most `budget` tasks per call; a drained queue restarts from the top
--- no more often than every 240 ticks (the C++ Plan::update cadence).
+-- no more often than every 1000 ticks (the C++ Plan::update cadence).
 function Plan:_process_queue(which, budget)
     local tasks = which == 'generic' and self.tasks_generic or self.tasks_furniture
     local idxfield = 'bg_idx_' .. which
@@ -880,7 +880,7 @@ function Plan:_process_queue(which, budget)
             -- drained: wait out the restart cadence, then begin a new pass
             local now = self:_tick_now()
             if self[waitfield] == nil then
-                self[waitfield] = now + 240
+                self[waitfield] = now + 1000
             end
             if now < self[waitfield] then
                 return
