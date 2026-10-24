@@ -787,23 +787,23 @@ do
         'all dig/construct tasks completed; only recurring check_rooms remains')
     check(r.status == 'dug', 'room advanced to dug (dig->construct chain fired)')
     check(p.bg_idx_generic > #p.tasks_generic,
-        'queue drained; restart gated at 240 ticks')
+        'queue drained; restart gated at 1000 ticks')
 
-    -- drain gate: before 240 ticks pass, nothing restarts
+    -- drain gate: before 1000 ticks pass, nothing restarts
     df_mock.global.cur_year_tick = 100
     p:update()
     check(p.bg_idx_generic > #p.tasks_generic and p.queue_wait_generic ~= nil,
-        'drained queue waits out the 240-tick cadence (tick 100 < 240)')
+        'drained queue waits out the 1000-tick cadence (tick 100 < 1000)')
 
     -- after the cadence: a new pass begins, check_rooms runs AGAIN
-    df_mock.global.cur_year_tick = 300
+    df_mock.global.cur_year_tick = 1200
     local ran_again = 0
     local old_checkrooms = p.checkrooms
     p.checkrooms = function(self2) ran_again = ran_again + 1 old_checkrooms(self2) end
     p:update()
     p.checkrooms = old_checkrooms
     check(ran_again >= 1 and p.bg_idx_generic == 2,
-        'new pass started after 240 ticks; check_rooms recurs (never deleted)')
+        'new pass started after 1000 ticks; check_rooms recurs (never deleted)')
 
     -- wantdig_max follows stock picks (C++ parity)
     check(p:_wantdig_max() == 2, 'wantdig_max defaults to 2 with no stocks')
