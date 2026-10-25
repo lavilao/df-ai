@@ -230,6 +230,7 @@ function AI:startup()
         safe(function() self.plan:startup() end, 'plan startup')
         -- kick the first plan update immediately so digging starts ASAP
         safe(function() self.plan:update() end, 'first plan update')
+        safe(function() self:step_builder_watch() end, 'first builder step')
     end
     if self.stocks then safe(function() self.stocks:startup() end, 'stocks startup') end
     if self.camera then safe(function() self.camera:startup() end, 'camera startup') end
@@ -242,6 +243,7 @@ end
 function AI:shutdown()
     debug_log('AI shutting down')
     repeatutil.cancel(GLOBAL_KEY .. '-plan')
+    repeatutil.cancel(GLOBAL_KEY .. '-builder')
     repeatutil.cancel(GLOBAL_KEY .. '-pop')
     repeatutil.cancel(GLOBAL_KEY .. '-pop-deathwatch')
     repeatutil.cancel(GLOBAL_KEY .. '-stocks')
@@ -288,31 +290,90 @@ function AI:clear()
     self.embark = nil
 end
 
+-- r3.8: unit-death EVENT hook (plugins.eventful.onUnitDeath) — the C++
+-- deathwatch polled every tick from native code (cheap there, brutal in
+-- Lua: one isAlive API crossing per unit per tick). The 25-tick sweep
+-- stays as a safety net; this hook fires the coffin logic the moment a
+-- unit dies regardless of sweep timing.
+function AI:register_unit_death_event()
+    local ok_ev, eventful = pcall(require, 'plugins.eventful')
+    if not ok_ev or type(eventful) ~= 'table' or not eventful.onUnitDeath then
+        return
+    end
+    eventful.onUnitDeath[GLOBAL_KEY] = function(unit_id)
+        local ai = the_ai
+        if not ai then return end
+        safe(function()
+            if ai.plan and ai.plan.setup_done then
+                ai.plan:getcoffin()
+            end
+        end, 'unit death -> getcoffin')
+    end
+end
+
+-- r3.8: one time-budgeted builder step from the update loop (the
+-- repeating task keeps stepping while the layout runs)
+function AI:step_builder_watch()
+    if self.plan and self.plan.builder and not self.plan.builder.done then
+        self.plan:step_builder()
+    end
+end
+
 function AI:register_repeating_tasks()
+    -- ============================================================
+    -- r3.8: tick cadences now match the C++ original (ai.cpp /
+    -- plan.cpp / stocks.cpp onupdate_register) instead of running an
+    -- order of magnitude faster. The r3.5-r3.7 cadences (plan 25,
+    -- stocks 50, deathwatch 1) hammered full world scans 10-12x more
+    -- often than the C++ ever did — on a real fort with 10k+ items
+    -- and hundreds of units that alone ate most of the frame budget.
+    -- ============================================================
+    self:register_unit_death_event()
     if self.plan then
-        repeatutil.scheduleEvery(GLOBAL_KEY .. '-plan', 25, 'ticks', function()
+        -- C++ plan.cpp: onupdate_register("df-ai plan", 240, 20, ...)
+        repeatutil.scheduleEvery(GLOBAL_KEY .. '-plan', 240, 'ticks', function()
             if self.plan then safe(function() self.plan:update() end, 'plan update') end
+        end)
+        -- r3.8: dedicated time-budgeted driver for the placement
+        -- builder (~8 ms of layout work every 2 ticks while a layout
+        -- is in flight — the game never blocks on placement again)
+        repeatutil.scheduleEvery(GLOBAL_KEY .. '-builder', 2, 'ticks', function()
+            if self.plan and self.plan.builder and not self.plan.builder.done then
+                safe(function() self.plan:step_builder() end, 'builder step')
+            end
         end)
     end
     if self.population then
+        -- C++ population.cpp: onupdate_register("df-ai pop", 25, 10, ...)
         repeatutil.scheduleEvery(GLOBAL_KEY .. '-pop', 25, 'ticks', function()
             if self.population then safe(function() self.population:update() end, 'population update') end
         end)
-        repeatutil.scheduleEvery(GLOBAL_KEY .. '-pop-deathwatch', 1, 'ticks', function()
+        -- C++ deathwatch scanned every tick from native code. In Lua a
+        -- full-unit isAlive sweep costs an API crossing PER unit, so
+        -- the sweep runs at the pop cadence and unit-death EVENTS
+        -- (eventful.onUnitDeath) trigger getcoffin immediately.
+        repeatutil.scheduleEvery(GLOBAL_KEY .. '-pop-deathwatch', 25, 'ticks', function()
             if self.population then safe(function() self.population:deathwatch() end, 'population deathwatch') end
         end)
     end
     if self.stocks then
-        repeatutil.scheduleEvery(GLOBAL_KEY .. '-stocks', 50, 'ticks', function()
+        -- C++ stocks.cpp: onupdate_register("df-ai stocks", 600, 30, ...)
+        -- (stocks audit = full item-world scan; 600 ticks was the
+        -- original cadence and it is plenty for order batching)
+        repeatutil.scheduleEvery(GLOBAL_KEY .. '-stocks', 600, 'ticks', function()
             if self.stocks then safe(function() self.stocks:update() end, 'stocks update') end
         end)
     end
     if self.camera then
-        repeatutil.scheduleEvery(GLOBAL_KEY .. '-camera', 5, 'ticks', function()
+        -- C++ camera.cpp: target rotation every 2000 ticks; the reveal
+        -- write itself is cheap but does not need to run every 5
+        -- ticks (r3.7 did — 240x the C++ rate)
+        repeatutil.scheduleEvery(GLOBAL_KEY .. '-camera', 50, 'ticks', function()
             if self.camera then safe(function() self.camera:update() end, 'camera update') end
         end)
     end
-    -- Announcement watcher
+    -- C++ ai.cpp: announcements every tick (cheap report-vector tail
+    -- check; 10 is fine in Lua and skips worldgen noise)
     repeatutil.scheduleEvery(GLOBAL_KEY .. '-announce', 10, 'ticks', function()
         safe(function() self:watch_announcements() end, 'announcements')
     end)
@@ -656,7 +717,7 @@ local function print_status()
 end
 
 local function print_version()
-    print('df-ai Lua rewrite for DF 53.16 (DFHack 53.16-r3) — build r3.7')
+    print('df-ai Lua rewrite for DF 53.16 (DFHack 53.16-r3) — build r3.8')
     print('Based on BenLubar/df-ai')
 end
 

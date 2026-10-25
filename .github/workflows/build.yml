@@ -58,6 +58,9 @@ jobs:
       - name: Blueprint engine tests (headless placement + priorities)
         run: lua5.3 test/test_blueprint_engine.lua
 
+      - name: Big-map performance regression (r3.8 perf rework)
+        run: lua5.3 test/test_perf_bigmap.lua
+
       - name: Validate JSON data (plans, room templates, schemas)
         run: |
           python3 - <<'EOF'

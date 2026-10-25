@@ -120,11 +120,10 @@ function Plan:update()
 
     if not self.setup_done then
         if self.builder then
-            -- resumable placement: ~750 tries per update tick batch
-            self.builder:step(3)
-            if self.builder.done then
-                self:_finish_setup()
-            end
+            -- r3.8: the builder has its OWN repeating task (every 2
+            -- ticks, time-budgeted) — see step_builder(). Plan:update
+            -- runs at the C++ 240-tick cadence and must not gate the
+            -- layout progress.
             return
         end
         -- bounded retry: setup failed at startup (e.g. map not ready);
@@ -146,6 +145,20 @@ function Plan:update()
     -- "the dwarves don't seem to do anything".
     self:process_tasks_generic(2)
     self:process_tasks_furniture(1)
+end
+
+-- r3.8: dedicated time-budgeted driver for the resumable placement
+-- builder. Registered from df-ai.lua at a 2-tick cadence while a
+-- layout is running; each call does at most ~8 ms of placement work so
+-- the game keeps rendering at full speed (the r3.7 engine did up to
+-- 750 tries per call — seconds of blocking per 25 ticks on a real
+-- 192x192 map, freezing the game the moment df-ai was enabled).
+function Plan:step_builder()
+    if not self.builder or self.builder.done then return end
+    self.builder:step_ms(8)
+    if self.builder.done then
+        self:_finish_setup()
+    end
 end
 
 function Plan:add_task(task_type, room, furniture, item_id)
@@ -790,19 +803,19 @@ function Plan:_run_generic_task(t)
             del = true
         end
     elseif t.type == TASK_TYPE.construct_workshop then
-        del, reason = construct_attempt(self, t, self.try_construct_construct_workshop)
+        del, reason = construct_attempt(self, t, self.try_construct_workshop)
     elseif t.type == TASK_TYPE.construct_furnace then
-        del, reason = construct_attempt(self, t, self.try_construct_construct_furnace)
+        del, reason = construct_attempt(self, t, self.try_construct_furnace)
     elseif t.type == TASK_TYPE.construct_stockpile then
-        del, reason = construct_attempt(self, t, self.try_construct_construct_stockpile)
+        del, reason = construct_attempt(self, t, self.try_construct_stockpile)
     elseif t.type == TASK_TYPE.construct_farmplot then
-        del, reason = construct_attempt(self, t, self.try_construct_construct_farmplot)
+        del, reason = construct_attempt(self, t, self.try_construct_farmplot)
     elseif t.type == TASK_TYPE.construct_activityzone then
-        del, reason = construct_attempt(self, t, self.try_construct_construct_activityzone)
+        del, reason = construct_attempt(self, t, self.try_construct_activityzone)
     elseif t.type == TASK_TYPE.construct_tradedepot then
-        del, reason = construct_attempt(self, t, self.try_construct_construct_tradedepot)
+        del, reason = construct_attempt(self, t, self.try_construct_tradedepot)
     elseif t.type == TASK_TYPE.construct_windmill then
-        del, reason = construct_attempt(self, t, self.try_construct_construct_windmill)
+        del, reason = construct_attempt(self, t, self.try_construct_windmill)
     elseif t.type == TASK_TYPE.check_rooms then
         self:checkrooms()
     elseif t.type == TASK_TYPE.check_construct then
@@ -816,17 +829,30 @@ function Plan:_run_generic_task(t)
     elseif t.type == TASK_TYPE.check_furnish then
         if t.room then
             local any_furnish = false
+            local done_count = 0
             for _, f in ipairs(t.room.layout) do
-                if f.bld_id < 0 and not f.ignore then
+                if f.ignore or f.gave_up or f.type == 'none' then
+                    done_count = done_count + 1
+                elseif f.bld_id < 0 then
+                    -- not placed yet
                     self:add_task(TASK_TYPE.furnish, t.room, f)
                     any_furnish = true
+                elseif not f._checked then
+                    -- placed but the completion phase (furnish_check:
+                    -- door flags, coffin burial, makeroom zones) has not
+                    -- run yet — queue it through the same task type
+                    self:add_task(TASK_TYPE.furnish, t.room, f)
+                    any_furnish = true
+                else
+                    done_count = done_count + 1
                 end
             end
             if any_furnish then
-                self:_log('furnishing ' .. describe_room(t.room) .. ' (+'
+                self:_log('furnishing ' .. describe_room(t.room) .. ' ('
                     .. #t.room.layout .. ' furniture)')
             end
-            if not any_furnish and t.room.status == 'finished' then
+            if not any_furnish and t.room.status == 'finished'
+                and done_count >= #t.room.layout then
                 t.room.furnished = true
             end
         end
@@ -837,6 +863,21 @@ function Plan:_run_generic_task(t)
         -- run, so the staged build order never executed.
         if priorities_module then
             priorities_module.checkidle(self)
+        end
+    elseif t.type == TASK_TYPE.monitor_cistern then
+        -- PERSISTENT task (C++ plan_cistern.cpp never deletes it):
+        -- coordinates the well-cistern input/output floodgates. Returns
+        -- (false, reason) — the reason lands in the task status.
+        local ok_m, keep, why = pcall(function()
+            return self:monitor_cistern()
+        end)
+        if not ok_m then
+            dfhack.printerr('[df-ai] cistern monitor failed: '
+                .. tostring(keep))
+            del = true
+        else
+            del = keep
+            reason = why
         end
     elseif t.type == TASK_TYPE.furnish then
         if t.room and t.furniture then
@@ -849,8 +890,8 @@ function Plan:_run_generic_task(t)
         end
     else
         -- task types without a ported handler (monitor_room_value,
-        -- monitor_cistern, setup_farmplot, rescue_caged, ...) must not
-        -- clog the queue forever.
+        -- setup_farmplot, rescue_caged, ...) must not clog the queue
+        -- forever.
         del = true
     end
     return del, reason
@@ -1230,7 +1271,7 @@ local FURNACE_TYPES_LIST = {
 
 function Plan:find_building_at(pos, building_type_name)
     for _, bld in ipairs(df.global.world.buildings.all) do
-        if bld.z_level == pos.z and bld.centerx == pos.x and bld.centery == pos.y then
+        if bld.z == pos.z and bld.centerx == pos.x and bld.centery == pos.y then
             return bld.id, bld
         end
     end
@@ -1245,11 +1286,14 @@ end
 -- extents; falls back to canonical building size when they are equal.
 -- `abstract` marks material-less buildings (stockpiles, farm plots) —
 -- constructBuilding REQUIRES one of items/filters/abstract in 53.16.
-local function construct_at(r, btype, subtype, custom, fields, width, height, abstract)
+-- `items` is an optional list of df.item (constructWithItems — the
+-- C++ material-selection path: workshops get blocks→boulder→wood,
+-- furnaces fire-safe boulders, forges anvil+fire-safe boulder).
+local function construct_at(r, btype, subtype, custom, fields, width, height, abstract, items)
     local pos = { x = r.min.x, y = r.min.y, z = r.min.z }
     local w = width or ((r.max.x - r.min.x) + 1)
     local h = height or ((r.max.y - r.min.y) + 1)
-    local ok, bld, err = pcall(dfhack.buildings.constructBuilding, {
+    local spec = {
         type = btype,
         subtype = subtype or -1,
         custom = custom or -1,
@@ -1258,13 +1302,116 @@ local function construct_at(r, btype, subtype, custom, fields, width, height, ab
         height = h,
         fields = fields,
         abstract = abstract or nil,
-    })
+    }
+    if items and #items > 0 then
+        spec.items = items
+    end
+    local ok, bld, err = pcall(dfhack.buildings.constructBuilding, spec)
     if not ok or not bld then
         dfhack.println('[df-ai] construct failed at ('
             .. pos.x .. ',' .. pos.y .. ',' .. pos.z .. '): ' .. tostring(err or bld))
         return nil
     end
     return bld
+end
+
+-- ============================================================
+-- Construction material selection (C++ plan_construct.cpp find_item)
+-- ============================================================
+-- Blocks first (efficient), then NON-ECONOMIC boulders (never burn
+-- flux/ore), then wood. Furnaces additionally need FIRE-SAFE material
+-- (isTemperatureSafe(1)); the forge needs a fire-safe ANVIL too.
+
+-- items.other category ids (built lazily — the pure-Lua test mocks
+-- have no items_other_id enum)
+local ITEMS_OTHER
+local function other_id(name)
+    if not ITEMS_OTHER then
+        ITEMS_OTHER = {}
+    end
+    local v = ITEMS_OTHER[name]
+    if v == nil then
+        local ok, id = pcall(function() return df.items_other_id[name] end)
+        v = (ok and id) or false
+        ITEMS_OTHER[name] = v
+    end
+    return v or nil
+end
+
+-- is this item usable as a building material right now? (mirrors the
+-- C++ Stocks::is_item_free: not in a job, not forbidden, on the map)
+local function item_free_for_build(item)
+    local ok, res = pcall(function()
+        if not dfhack.items.isOnMap(item) then return false end
+        if dfhack.items.getGeneralRef(item, df.general_ref_type.BUILDING_HOLDER) then
+            return false
+        end
+        -- items hauled by an active job are reserved
+        for _, ref in ipairs(item.general_refs) do
+            local rt = ref:getType()
+            if rt == df.general_ref_type.IS_ARTIFACT then -- ignore
+            elseif rt == df.general_ref_type.UNIT_HOLDER then return false end
+        end
+        local job = dfhack.items.getJob(item, 0, false)
+        if job then return false end
+        return true
+    end)
+    return ok and res or false
+end
+
+-- one fire-safe check per item (vmethod: 1 = fire, 2 = magma)
+local function item_temperature_safe(item)
+    local ok, res = pcall(function() return item:isTemperatureSafe(1) end)
+    return ok and res or false
+end
+
+-- economic-stone gate: boulders of economic stone (flux/ore) are never
+-- spent on walls (C++ checks ui->economic_stone[mat_index])
+local function boulder_is_economic(item)
+    local ok, res = pcall(function()
+        if item.mat_type ~= 0 then return false end
+        local eco = df.global.plotinfo.economic_stone
+        if not eco then return false end
+        return eco[item.mat_index] == true
+    end)
+    return ok and res or false
+end
+
+-- find up to `n` free items of an items.other category with the C++
+-- gates: fire_safe → isTemperatureSafe(1); non_economic → skip
+-- economic boulders. Returns a list of df.item.
+local function find_build_materials(category, n, fire_safe, non_economic)
+    local out = {}
+    local others = df.global.world.items.other
+    local cid = category and other_id(category)
+    local vec = cid and others and others[cid]
+    if not vec then return out end
+    for _, item in ipairs(vec) do
+        if #out >= n then break end
+        if item_free_for_build(item)
+            and (not fire_safe or item_temperature_safe(item))
+            and (not non_economic or not boulder_is_economic(item)) then
+            table.insert(out, item)
+        end
+    end
+    return out
+end
+
+-- count of free items in a category (for logging / skip decisions)
+local function count_free_materials(category, fire_safe, non_economic)
+    local n = 0
+    local others = df.global.world.items.other
+    local cid = category and other_id(category)
+    local vec = cid and others and others[cid]
+    if not vec then return 0 end
+    for _, item in ipairs(vec) do
+        if item_free_for_build(item)
+            and (not fire_safe or item_temperature_safe(item))
+            and (not non_economic or not boulder_is_economic(item)) then
+            n = n + 1
+        end
+    end
+    return n
 end
 
 -- Find a custom workshop def (e.g. SCREW_PRESS) in the raws; returns index or -1
@@ -1310,6 +1457,79 @@ local WORKSHOP_BUILD = {
     [df.workshop_type.Custom]        = { df.building_type.Workshop, df.workshop_type.Custom, nil }, -- custom resolved by caller
 }
 
+-- C++ init_managed_workshop: cap the workshop's own job queue at 10 so
+-- one shop cannot hoard every order (workshop_profile.max_general_orders)
+local function init_managed_workshop(bld)
+    if not bld then return end
+    pcall(function() bld.profile.max_general_orders = 10 end)
+end
+
+-- C++ Plan::try_construct_workshop material matrix (plan_construct.cpp):
+--   Dyers        barrel + bucket
+--   Ashery       block + barrel + bucket
+--   Forge        fire-safe anvil + fire-safe non-economic boulder
+--   Quern        a quern tool
+--   everything   blocks → non-economic boulder → wood
+--   else
+-- Returns the item list, or nil + a missing-parts description.
+local WORKSHOP_MATERIAL_MISS = {
+    rate_limit = {},
+}
+local function workshop_materials(wt)
+    local WT = df.workshop_type
+    local miss = function(what)
+        local last = WORKSHOP_MATERIAL_MISS.rate_limit[what]
+        local now = df.global.cur_year_tick or 0
+        if not last or now - last > 6000 then
+            WORKSHOP_MATERIAL_MISS.rate_limit[what] = now
+            dfhack.println('[df-ai:plan] waiting for ' .. what)
+        end
+        return nil, what
+    end
+
+    if wt == WT.Dyers then
+        local barrel = find_build_materials('BARREL', 1)
+        local bucket = find_build_materials('BUCKET', 1)
+        if #barrel == 1 and #bucket == 1 then
+            return { barrel[1], bucket[1] }
+        end
+        local what = (#barrel == 0) and 'barrel' or 'bucket'
+        return miss(what)
+    elseif wt == WT.Ashery then
+        local block = find_build_materials('BLOCKS', 1)
+        local barrel = find_build_materials('BARREL', 1)
+        local bucket = find_build_materials('BUCKET', 1)
+        if #block == 1 and #barrel == 1 and #bucket == 1 then
+            return { block[1], barrel[1], bucket[1] }
+        end
+        local what = (#block == 0) and 'blocks'
+            or (#barrel == 0) and 'barrel' or 'bucket'
+        return miss(what)
+    elseif wt == WT.MetalsmithsForge then
+        local anvil = find_build_materials('ANVIL', 1, true)
+        local bould = find_build_materials('BOULDER', 1, true, true)
+        if #anvil == 1 and #bould == 1 then
+            return { anvil[1], bould[1] }
+        end
+        local what = (#anvil == 0) and 'anvil'
+            or 'fire-safe boulder'
+        return miss(what)
+    elseif wt == WT.Quern then
+        local quern = find_build_materials('QUERN', 1)
+        if #quern == 1 then return { quern[1] } end
+        return miss('quern')
+    end
+
+    -- generic: blocks → non-economic boulder → wood (C++ find_item chain)
+    local blocks = find_build_materials('BLOCKS', 1)
+    if #blocks == 1 then return blocks end
+    local bould = find_build_materials('BOULDER', 1, false, true)
+    if #bould == 1 then return bould end
+    local wood = find_build_materials('WOOD', 1)
+    if #wood == 1 then return wood end
+    return miss('building material (blocks/boulder/wood)')
+end
+
 function Plan:try_construct_workshop(r)
     if not r then return false end
     local wt = r.workshop_type
@@ -1335,9 +1555,19 @@ function Plan:try_construct_workshop(r)
         end
     end
 
-    local bld = construct_at(r, spec[1], spec[2], custom, nil, spec[4], spec[5])
+    -- r3.8: C++ material selection (never burns economic stone, fire-safe
+    -- anvil for the forge, blocks before boulders before wood). Falls back
+    -- to the auto-filters when the specific items are not available yet —
+    -- the stocks Watch keeps ordering more in the background.
+    local items, missing = workshop_materials(wt)
+    if not items then
+        return false, missing
+    end
+
+    local bld = construct_at(r, spec[1], spec[2], custom, nil, spec[4], spec[5], nil, items)
     if bld then
         r.bld_id = bld.id
+        init_managed_workshop(bld)
         return true
     end
     return false
@@ -1352,9 +1582,24 @@ function Plan:try_construct_furnace(r)
         return true
     end
 
-    local bld = construct_at(r, df.building_type.Furnace, ft)
+    -- C++: every standard furnace needs FIRE-SAFE NON-ECONOMIC boulders
+    -- (smelter/forge line); wood furnaces are the cheapest fire-safe build.
+    local FT = df.furnace_type
+    local bould = find_build_materials('BOULDER', 1, true, true)
+    if #bould == 0 then
+        local last = WORKSHOP_MATERIAL_MISS.rate_limit['fire-safe boulder']
+        local now = df.global.cur_year_tick or 0
+        if not last or now - last > 6000 then
+            WORKSHOP_MATERIAL_MISS.rate_limit['fire-safe boulder'] = now
+            dfhack.println('[df-ai:plan] waiting for fire-safe boulder')
+        end
+        return false, 'fire-safe boulder'
+    end
+
+    local bld = construct_at(r, df.building_type.Furnace, ft, -1, nil, nil, nil, nil, bould)
     if bld then
         r.bld_id = bld.id
+        init_managed_workshop(bld)
         return true
     end
     return false
@@ -1493,7 +1738,21 @@ function Plan:try_construct_tradedepot(r)
         return true
     end
 
-    local bld = construct_at(r, df.building_type.TradeDepot)
+    -- C++: the depot is built from exactly 3 blocks (constructWithItems)
+    local blocks = find_build_materials('BLOCKS', 3)
+    if #blocks < 3 then
+        local last = WORKSHOP_MATERIAL_MISS.rate_limit['depot blocks']
+        local now = df.global.cur_year_tick or 0
+        if not last or now - last > 6000 then
+            WORKSHOP_MATERIAL_MISS.rate_limit['depot blocks'] = now
+            dfhack.println('[df-ai:plan] waiting for depot blocks ('
+                .. #blocks .. '/3)')
+        end
+        return false, 'depot blocks'
+    end
+
+    local bld = construct_at(r, df.building_type.TradeDepot, -1, -1, nil,
+        nil, nil, nil, blocks)
     if bld then
         r.bld_id = bld.id
         return true
@@ -1607,10 +1866,25 @@ function Plan:try_furnish(r, f)
     -- "furniture has no building mapping: none", live-verified r3.6)
     if f.type == 'none' then return true end
 
-    -- already placed (and the building still exists) → done
+    -- already placed (and the building still exists) → run the C++
+    -- furnish_check completion phase once, then done
     if f.bld_id and f.bld_id >= 0 then
         local fb = self:_find_building(f.bld_id)
-        if fb then return true end
+        if fb then
+            if not f._checked then
+                local ok_c, done = pcall(function()
+                    return self:_furnish_check(r, f, fb)
+                end)
+                if not ok_c then
+                    dfhack.printerr('[df-ai] furnish check failed: '
+                        .. tostring(done))
+                    return true
+                end
+                if not done then return false end
+                f._checked = true
+            end
+            return true
+        end
         f.bld_id = -1
     end
     -- ignored furniture (activation gates: cage-trap rings, optional
@@ -1751,9 +2025,544 @@ function Plan:try_furnish(r, f)
     return false
 end
 
+-- C++ Plan::furnish_check — the completion phase after a furniture
+-- building exists: wait for construction, then apply the type-specific
+-- configuration (door flags, hatch behavior, jail justice, archery
+-- target) and finally makeroom (v50: create the room's civzone).
+-- Returns true when this furniture is fully DONE.
+function Plan:_furnish_check(r, f, bld)
+    -- destroyed building? try_furnish's caller resets bld_id
+    if not bld then return true end
+
+    -- wait for the construction job to finish
+    local ok_s, stage, max = pcall(function()
+        return bld:getBuildStage(), bld:getMaxBuildStage()
+    end)
+    if ok_s and stage and max and stage < max then
+        f._wait_reason = 'waiting for construction (' .. tostring(stage)
+            .. '/' .. tostring(max) .. ')'
+        return false
+    end
+
+    -- type-specific post-construct configuration (C++ furnish_check)
+    if f.type == 'archery_target' then
+        f.makeroom = true
+    elseif f.type == 'door' then
+        if df.building_doorst:is_instance(bld) then
+            pcall(function()
+                bld.door_flags.pet_passable = true
+                bld.door_flags.internal = f.internal == true
+            end)
+        end
+    elseif f.type == 'hatch' then
+        if df.building_hatchst:is_instance(bld) then
+            pcall(function()
+                if r.type == 'pitcage' then
+                    bld.door_flags.forbidden = true
+                    bld.door_flags.pet_passable = false
+                else
+                    bld.door_flags.pet_passable = true
+                end
+                bld.door_flags.internal = f.internal == true
+            end)
+        end
+    end
+
+    -- jail cages/restraints: justice buildings (C++ sets a 1x1 room +
+    -- justice flag; v50 keeps the flag on the building)
+    if r.type == 'jail' and (f.type == 'cage' or f.type == 'restraint') then
+        pcall(function() bld.flags.justice = true end)
+    end
+
+    -- r3.8 C++ furnish_check: coffins allow burial, no pets (the
+    -- cemetery zone flags handle the rest; without allow_burial DF
+    -- never buries anyone in them)
+    if f.type == 'coffin' and df.building_coffinst:is_instance(bld) then
+        pcall(function()
+            bld.burial_mode.allow_burial = true
+            bld.burial_mode.no_citizens = false
+            bld.burial_mode.no_pets = true
+        end)
+    end
+
+    -- r3.8 C++ setup_lever: once the lever is BUILT, link it to its
+    -- target (floodgate), pull it once (neutral state), and start the
+    -- cistern monitor for input levers.
+    if f.type == 'lever' and f.target then
+        local ok_l, done = pcall(function()
+            return self:setup_lever(r, f)
+        end)
+        if not ok_l then
+            dfhack.printerr('[df-ai] lever setup failed: ' .. tostring(done))
+            return true
+        end
+        if not done then
+            f._wait_reason = 'lever link pending'
+            return false
+        end
+        return true
+    end
+
+    -- makeroom (v50: zone the room once dug)
+    if f.makeroom and r.status ~= 'plan' then
+        local reason
+        if not r:is_dug(reason) then
+            f._wait_reason = 'waiting to make room'
+            return false
+        end
+        -- rooms with no v50 civzone equivalent (infirmary → location,
+        -- not zone) are done once dug — do not block on a zone that
+        -- will never exist
+        if room_zone_subtype(r.type) then
+            local zb = self:_ensure_room_zone(r)
+            if not zb then
+                f._wait_reason = 'zone creation pending'
+                return false
+            end
+            -- barracks zones get their squad flags when a squad claims the
+            -- room (getsoldierbarrack); bedroom zones get owners via
+            -- set_owner. Dining halls are communal — the zone alone is it.
+        end
+    end
+
+    return true
+end
+
 -- ============================================================
--- Room assignment
+-- Levers & cisterns (plan_cistern.cpp port, r3.8)
+--
+-- The well template places two levers: `internal` = the INPUT gate
+-- (river → reserve), non-internal = the OUTPUT gate (reserve → the
+-- cistern under the well). setup_lever links each lever to its
+-- floodgate with a real LinkBuildingToTrigger job (2 mechanisms);
+-- monitor_cistern then coordinates the gates so the cistern fills
+-- without flooding the fort. The C++ channel_enable/test-gate block
+-- (0.47 river aqueducts) has no template data in generic01 and is
+-- intentionally not ported.
 -- ============================================================
+
+-- C++ Plan::pull_lever: queue a PullLever job on the lever building
+-- (same shape as DFHack's own lever.lua leverPullJob).
+function Plan:pull_lever(f)
+    local bld = self:_find_building(f.bld_id or -1)
+    if not bld then return false, 'lever missing' end
+    for _, job in ipairs(bld.jobs or {}) do
+        if job.job_type == df.job_type.PullLever then
+            return true, 'waiting for someone to pull the lever'
+        end
+    end
+    if #(bld.jobs or {}) >= 10 then
+        return false, 'lever job list is full'
+    end
+    local ok, err = pcall(function()
+        local ref = df.general_ref_building_holderst:new()
+        ref.building_id = bld.id
+        local job = df.job:new()
+        job.job_type = df.job_type.PullLever
+        job.pos = { x = bld.x1, y = bld.y1, z = bld.z }
+        job.general_refs:insert('#', ref)
+        bld.jobs:insert('#', job)
+        dfhack.job.linkIntoWorld(job, true)
+        dfhack.job.checkBuildingsNow()
+    end)
+    if not ok then
+        dfhack.printerr('[df-ai] pull lever failed: ' .. tostring(err))
+        return false, 'pull lever failed'
+    end
+    return true, 'waiting for someone to pull the lever'
+end
+
+-- C++ Plan::link_lever: queue a LinkBuildingToTrigger job wiring the
+-- lever building to its target floodgate. Idempotent: returns true
+-- once linked (or a link job is pending returns false-wait).
+function Plan:link_lever(src, dst)
+    local bld = self:_find_building(src.bld_id or -1)
+    if not bld then return false, 'lever not constructed' end
+    local ok_s, stage, max = pcall(function()
+        return bld:getBuildStage(), bld:getMaxBuildStage()
+    end)
+    if not ok_s or not stage or not max or stage < max then
+        return false, 'lever not constructed'
+    end
+
+    local tbld = self:_find_building(dst.bld_id or -1)
+    if not tbld then return false, 'lever target not constructed' end
+    local ok_t, tstage, tmax = pcall(function()
+        return tbld:getBuildStage(), tbld:getMaxBuildStage()
+    end)
+    if not ok_t or not tstage or not tmax or tstage < tmax then
+        return false, 'lever target not constructed'
+    end
+
+    -- already linked? (mechanisms inside the lever reference the target)
+    local already = false
+    pcall(function()
+        for _, ci in ipairs(bld.contained_items or {}) do
+            for _, ref in ipairs(ci.item.general_refs or {}) do
+                if ref:getType() == df.general_ref_type.BUILDING_TRIGGERTARGET
+                    and ref.building_id == tbld.id then
+                    already = true
+                end
+            end
+        end
+    end)
+    if already then return true, 'linked' end
+
+    -- link job already queued for this target?
+    for _, job in ipairs(bld.jobs or {}) do
+        if job.job_type == df.job_type.LinkBuildingToTrigger then
+            for _, ref in ipairs(job.general_refs or {}) do
+                if ref:getType() == df.general_ref_type.BUILDING_TRIGGERTARGET
+                    and ref.building_id == tbld.id then
+                    return false, 'waiting for lever to be linked to target'
+                end
+            end
+        end
+    end
+
+    if #(bld.jobs or {}) >= 10 then
+        return false, 'lever job list is full'
+    end
+
+    local mechas = find_build_materials('TRAPPARTS', 2)
+    if #mechas < 2 then
+        return false, 'need 2 mechanisms'
+    end
+
+    local ok, err = pcall(function()
+        local reflink = df.general_ref_building_triggertargetst:new()
+        reflink.building_id = tbld.id
+        local refhold = df.general_ref_building_holderst:new()
+        refhold.building_id = bld.id
+
+        local job = df.job:new()
+        job.job_type = df.job_type.LinkBuildingToTrigger
+        job.general_refs:insert('#', reflink)
+        job.general_refs:insert('#', refhold)
+        bld.jobs:insert('#', job)
+        dfhack.job.linkIntoWorld(job, true)
+
+        -- role constants live in job_role_type in 53.16 (live-verified:
+        -- df.job_item_ref has no LinkToTrigger/LinkToTarget members)
+        dfhack.job.attachJobItem(job, mechas[1],
+            df.job_role_type.LinkToTarget, -1, 0)
+        dfhack.job.attachJobItem(job, mechas[2],
+            df.job_role_type.LinkToTrigger, -1, 0)
+    end)
+    if not ok then
+        dfhack.printerr('[df-ai] lever link failed: ' .. tostring(err))
+        return false, 'lever link failed'
+    end
+    return false, 'waiting for lever to be linked to target'
+end
+
+-- C++ Plan::setup_lever — called from furnish_check when a lever with
+-- a target finishes construction.
+function Plan:setup_lever(r, f)
+    if not f.target then return true end
+    local linked = self:link_lever(f, f.target)
+    if not linked then
+        return false
+    end
+    self:pull_lever(f)
+    if f.internal then
+        self:add_task(TASK_TYPE.monitor_cistern)
+    end
+    return true
+end
+
+-- floodgate state helpers (C++ gate_flags: closed/closing/opening)
+local function gate_closed(bld)
+    if not bld then return true end
+    local ok, res = pcall(function()
+        local gf = bld.gate_flags
+        local shut = gf.closed or gf.closing
+        return shut and not gf.opening
+    end)
+    return ok and res or true
+end
+
+local function lever_linked(bld)
+    if not bld then return false end
+    local ok, res = pcall(function()
+        return #bld.linked_mechanisms > 0
+    end)
+    return ok and res or false
+end
+
+local function flow_size_at(pos)
+    local ok, res = pcall(function()
+        local des = dfhack.maps.getTileDesignation(pos)
+        return des and des.flow_size or 0
+    end)
+    return ok and res or 0
+end
+
+-- C++ Plan::monitor_cistern — PERSISTENT task coordinating the well
+-- cistern gates. Simplified r3.8 port: the channel_enable/test-gate
+-- phase (0.47 river probing) is omitted — generic01 has no data for
+-- it; the fill coordination is faithful.
+function Plan:monitor_cistern()
+    if not self._mc then
+        local cist, reserve
+        for _, r in ipairs(self.rooms) do
+            if r.type == 'cistern' then
+                if r.cistern_type == 'well' and not cist then cist = r end
+                if r.cistern_type == 'reserve' and not reserve then reserve = r end
+            end
+        end
+        if not cist or not reserve then
+            return false, 'no well cistern pair'
+        end
+        local lever_in, lever_out
+        for _, r in ipairs(self.rooms) do
+            for _, f in ipairs(r.layout or {}) do
+                if f.type == 'lever' and f.target then
+                    if f.internal then
+                        lever_in = lever_in or f
+                    else
+                        lever_out = lever_out or f
+                    end
+                end
+            end
+        end
+        if not lever_in or not lever_out then
+            return false, 'cistern levers not found'
+        end
+        self._mc = {
+            cistern = cist, reserve = reserve,
+            lever_in = lever_in, lever_out = lever_out,
+        }
+        self:_log('cistern monitor started (well cistern)')
+    end
+    local mc = self._mc
+
+    local l_in = self:_find_building(mc.lever_in.bld_id or -1)
+    local f_in = mc.lever_in.target
+        and self:_find_building(mc.lever_in.target.bld_id or -1) or nil
+    local l_out = self:_find_building(mc.lever_out.bld_id or -1)
+    local f_out = mc.lever_out.target
+        and self:_find_building(mc.lever_out.target.bld_id or -1) or nil
+
+    -- phase 1 (C++): input linked and open → activate the reserve's
+    -- furniture (floodgates were ignore=true so workers could not be
+    -- walled in before the input gate existed)
+    if l_in and f_in and not f_out and lever_linked(l_in) then
+        if gate_closed(f_in) then
+            self:pull_lever(mc.lever_in)
+            return false, 'opening input floodgate'
+        end
+        local changed = false
+        for _, f in ipairs(mc.reserve.layout or {}) do
+            if f.ignore then
+                f.ignore = false
+                changed = true
+            end
+        end
+        if changed then
+            self:furnish_room(mc.reserve)
+        end
+    end
+
+    if not l_in or not f_in or not l_out or not f_out then
+        return false, 'waiting for mechanic'
+    end
+    if not lever_linked(l_in) or not lever_linked(l_out) then
+        return false, 'waiting for levers to be linked'
+    end
+    if #(l_in.jobs or {}) > 0 or #(l_out.jobs or {}) > 0 then
+        return false, 'lever waiting to be pulled'
+    end
+
+    -- mechanisms are flowing again: activate the entrance cage traps
+    -- (C++ defers them until the cistern levers are linked)
+    if self.fort_entrance and not self._mc_entrance_done then
+        local changed = false
+        for _, f in ipairs(self.fort_entrance.layout or {}) do
+            if f.ignore then
+                f.ignore = false
+                changed = true
+            end
+        end
+        if changed then
+            self:furnish_room(self.fort_entrance)
+        end
+        self._mc_entrance_done = true
+    end
+
+    local f_in_closed = gate_closed(f_in)
+    local f_out_closed = gate_closed(f_out)
+
+    -- water levels (C++: cistern pos z+1 = top floor; reserve pos)
+    local cpos = mc.cistern:pos()
+    local cistlvl = flow_size_at({ x = cpos.x, y = cpos.y, z = cpos.z + 1 })
+    local rpos = mc.reserve:pos()
+    local resvlvl = flow_size_at(rpos)
+
+    if resvlvl <= 1 then
+        -- reserve empty: close the output, open the input
+        if not f_out_closed then
+            self:pull_lever(mc.lever_out)
+            return false, 'reserve empty; closing output'
+        elseif f_in_closed then
+            self:pull_lever(mc.lever_in)
+            return false, 'reserve empty; opening input'
+        end
+        return false, 'reserve empty; filling'
+    elseif resvlvl >= 7 then
+        -- reserve full: close the input, drain into the cistern
+        if not f_in_closed then
+            self:pull_lever(mc.lever_in)
+            return false, 'reserve full; closing input'
+        end
+        if cistlvl < 7 then
+            if f_out_closed then
+                self:pull_lever(mc.lever_out)
+                return false, 'cistern filling (' .. cistlvl .. '/7); opening output'
+            end
+            return false, 'cistern filling (' .. cistlvl .. '/7)'
+        end
+        if not f_out_closed then
+            self:pull_lever(mc.lever_out)
+            return false, 'cistern full; closing output'
+        end
+        return false, 'cistern full'
+    end
+
+    -- mid-fill: ensure exactly one gate is open
+    if f_in_closed and f_out_closed then
+        if resvlvl >= 6 and cistlvl < 7 then
+            self:pull_lever(mc.lever_out)
+            return false, 'opening output'
+        end
+        self:pull_lever(mc.lever_in)
+        return false, 'opening input'
+    end
+    return false, ('cistern %d/7, reserve %d/7'):format(cistlvl, resvlvl)
+end
+
+-- ============================================================
+-- Room assignment (plan_assign.cpp port, v50 civzone-based rooms)
+--
+-- v50/53.16 has no building.is_room / bld.owner any more: "rooms" are
+-- CIVZONE buildings (Bedroom / DiningHall / Office / Barracks / Tomb
+-- / Dungeon zones) with assigned_unit_id + squad_room_info. The C++
+-- makeroom(set_extents + is_room) translates to "create the matching
+-- zone over the dug room". dfhack.buildings.setOwner(zone, unit)
+-- handles owned_buildings + spouse sharing.
+-- ============================================================
+
+local ROOM_ZONE_TYPE = {
+    bedroom = 'Bedroom',
+    dormitory = 'Dormitory',
+    dininghall = 'DiningHall',
+    nobleroom = 'Office',
+    office = 'Office',
+    barracks = 'Barracks',
+    cemetery = 'Tomb',
+    tomb = 'Tomb',
+    jail = 'Dungeon',
+    -- infirmary intentionally absent: v50 hospitals are LOCATIONS
+    -- (abstract buildings), not civzones — df.civzone_type has no
+    -- Hospital member on 53.16 (live-verified). The room is still
+    -- dug and furnished with beds/restraints; hospital registration
+    -- belongs to the game's location system.
+    meeting = 'MeetingHall',
+    location = 'MeetingHall',
+}
+
+-- does this room type get a v50 civzone at all? (invalid/missing enum
+-- members must NOT fall through to a wrong-zone default)
+local function room_zone_subtype(rtype)
+    local zt = ROOM_ZONE_TYPE[rtype]
+    if not zt then return nil end
+    local ok, sub = pcall(function() return df.civzone_type[zt] end)
+    if not ok or not sub then return nil end
+    return sub
+end
+
+-- create (or find) the civzone covering a dug room. Returns the
+-- building or nil. One zone per room (tracked on the room itself).
+-- Rooms whose type has no v50 civzone (infirmary, corridors, ...) get
+-- no zone at all — never a wrong-zone fallback.
+function Plan:_ensure_room_zone(r)
+    if not r or r.status == 'plan' then return nil end
+    if r.zone_id and r.zone_id >= 0 then
+        local zb = df.building.find(r.zone_id)
+        if zb then return zb end
+        r.zone_id = -1
+    end
+    local subtype = room_zone_subtype(r.type)
+    if not subtype then return nil, 'no zone type for ' .. tostring(r.type) end
+    -- permanent give-up: a room whose zone cannot be created must not
+    -- retry forever (the r3.6 trap-loop lesson, applied to zones)
+    if r.zone_gave_up then return nil, 'zone creation gave up' end
+    -- the room must be dug before zoning it (C++ makeroom waited for
+    -- is_dug the same way)
+    local reason
+    if not r:is_dug(reason) then return nil end
+
+    local pos = r:pos()
+    local width = (r.max.x - r.min.x) + 1
+    local height = (r.max.y - r.min.y) + 1
+    -- quickfort's zone.lua pattern: a civzone needs room.extents to
+    -- cover tiles, plus assigned_unit_id (live-verified DFHack API)
+    local bld, err
+    local ok_c = pcall(function()
+        local area = width * height
+        local extents = df.reinterpret_cast(df.building_extents_type,
+            df.new('uint8_t', area))
+        for i = 0, area - 1 do extents[i] = 1 end
+        bld, err = dfhack.buildings.constructBuilding{
+            type = df.building_type.Civzone,
+            subtype = subtype,
+            abstract = true,
+            pos = { x = r.min.x, y = r.min.y, z = pos.z },
+            width = width,
+            height = height,
+            fields = {
+                assigned_unit_id = -1,
+                room = { x = r.min.x, y = r.min.y, width = width,
+                    height = height, extents = extents },
+            },
+        }
+    end)
+    if not ok_c then err = err or 'constructBuilding threw' end
+    if not bld then
+        r.zone_fail = (r.zone_fail or 0) + 1
+        if r.zone_fail <= 3 or r.zone_fail % 20 == 0 then
+            dfhack.println('[df-ai] zone creation failed for ' .. r.type
+                .. ': ' .. tostring(err))
+        end
+        if r.zone_fail >= 10 then
+            r.zone_gave_up = true
+            self:_log('giving up zoning ' .. r.type .. ' room at '
+                .. r.min.x .. ',' .. r.min.y .. ',' .. pos.z)
+        end
+        return nil, tostring(err)
+    end
+    r.zone_id = bld.id
+    -- tomb zones: citizens allowed, pets not (C++ coffin burial_mode)
+    if df.building_civzonest:is_instance(bld) and subtype == df.civzone_type.Tomb then
+        pcall(function()
+            bld.type_data.flags.no_pets = true
+            bld.type_data.flags.no_citizens = false
+        end)
+    end
+    self:_log('zoned ' .. r.type .. ' room at ' .. r.min.x .. ',' .. r.min.y
+        .. ',' .. pos.z .. ' (bld ' .. bld.id .. ')')
+    return bld
+end
+
+-- C++ Plan::set_owner — assign/release a room's owner (v50: zone
+-- assigned_unit_id via dfhack.buildings.setOwner)
+function Plan:set_owner(r, uid)
+    r.owner = uid
+    local zb = self:_ensure_room_zone(r)
+    if not zb then return end
+    local u = uid and uid >= 0 and df.unit.find(uid) or nil
+    pcall(function() dfhack.buildings.setOwner(zb, u) end)
+end
 
 function Plan:getbedroom(unit_id)
     if not self.ai.population then return end
@@ -1769,75 +2578,439 @@ function Plan:getbedroom(unit_id)
     end
     for _, r in ipairs(rooms) do
         if r.owner < 0 and r.status ~= 'plan' then
-            r.owner = unit_id
-            local bld = r:dfbuilding()
-            if bld then
-                pcall(function() bld.room.owner = df.unit.find(unit_id) end)
-            end
+            self:set_owner(r, unit_id)
+            self:_log('assigned bedroom to unit ' .. unit_id)
+            if r.status == 'finished' then self:furnish_room(r) end
             return r
         end
     end
     for _, r in ipairs(rooms) do
         if r.owner < 0 and r.status == 'plan' and not r.queue_dig then
-            r.owner = unit_id
             self:wantdig(r, -1)
+            self:set_owner(r, unit_id)
+            self:_log('digging new bedroom for unit ' .. unit_id)
             return r
         end
     end
     return nil
 end
 
+-- shared-furniture user count helper (must be declared before the
+-- functions below use it as an upvalue)
+local function count_users(o)
+    local n = 0
+    for _ in pairs(o.users or {}) do n = n + 1 end
+    return n
+end
+
+-- C++ Plan::getcoffin — claim the next unused coffin of a cemetery
+-- room that still has unclaimed has_users coffins, and dig that room.
+-- Population::update_deads calls this once per NEEDED coffin after its
+-- own census (3 + unburied - free - planned).
 function Plan:getcoffin()
-    -- rate-limit: population calls this for every unburied corpse on
-    -- every update; without a limit it printed "Need a coffin" per tick
-    self._coffin_log = self._coffin_log or 0
-    local now = self:_tick_now()
-    if now - self._coffin_log > 1200 then
-        self._coffin_log = now
-        dfhack.println('[df-ai] Need a coffin (cemetery not ready yet)')
+    if not self.ai.population then return end
+    for _, r in ipairs(self.room_category['cemetery'] or {}) do
+        local has_free = false
+        for _, f in ipairs(r.layout) do
+            if f.has_users and count_users(f) == 0 then
+                has_free = true break
+            end
+        end
+        if has_free then
+            self:wantdig(r, -1)
+            for _, f in ipairs(r.layout) do
+                if f.type == 'coffin' and count_users(f) == 0 then
+                    f.users = f.users or {}
+                    f.users[-1] = true -- claimed (C++ inserts -1)
+                    f.ignore = false
+                    self:_log('claimed a coffin in the cemetery')
+                    break
+                end
+            end
+            if r.status == 'finished' then
+                self:furnish_room(r)
+            end
+            return
+        end
     end
 end
 
+-- C++ Plan::getdiningroom — shared-furniture users: farm work rights +
+-- one table + one chair per dwarf in the dining hall.
 function Plan:getdiningroom(unit_id)
     if not self.ai.population then return end
-    local rooms = self.room_category['dininghall']
-    if not rooms then return end
-    for _, r in ipairs(rooms) do
-        if r.owner < 0 and r.status == 'finished' then
-            r.owner = unit_id
-            return r
+
+    -- already has a spot?
+    for _, r in ipairs(self.room_category['dininghall'] or {}) do
+        for _, f in ipairs(r.layout) do
+            if f.users and f.users[unit_id] then return end
         end
     end
-    return nil
+
+    -- farm work rights (C++: 4 farmplot slots, indoor food/cloth first)
+    local farm_specs = {
+        { 'food', false }, { 'cloth', false },
+        { 'food', true }, { 'cloth', true },
+    }
+    for _, spec in ipairs(farm_specs) do
+        for _, r in ipairs(self.room_category['farmplot'] or {}) do
+            if (r.farm_type or 'food') == spec[1]
+                and r.outdoor == spec[2]
+                and (not r.users or count_users(r) < (r.has_users or 1)) then
+                self:wantdig(r, -3)
+                r.users = r.users or {}
+                r.users[unit_id] = true
+                break
+            end
+        end
+    end
+
+    for _, r in ipairs(self.room_category['dininghall'] or {}) do
+        local free_table, free_chair
+        for _, f in ipairs(r.layout) do
+            if f.type == 'table' and f.has_users
+                and (not f.users or count_users(f) < f.has_users) then
+                free_table = f
+            end
+            if f.type == 'chair' and f.has_users
+                and (not f.users or count_users(f) < f.has_users) then
+                free_chair = f
+            end
+        end
+        if free_table or free_chair then
+            self:wantdig(r, -2)
+            for _, f in ipairs { free_table, free_chair } do
+                if f then
+                    f.users = f.users or {}
+                    f.users[unit_id] = true
+                    f.ignore = false
+                end
+            end
+            if r.status == 'finished' then
+                self:furnish_room(r)
+            end
+            return
+        end
+    end
 end
 
-function Plan:getsoldierbarrack(squad_id)
-    if not self.ai.population then return end
+-- C++ Plan::getsoldierbarrack — squad barracks + furniture users
+-- (weapon_rack/armor_stand/bed/cabinet/chest/archery_target per dwarf)
+function Plan:getsoldierbarrack(unit_id)
+    if not self.ai.population then return nil end
+    local u = df.unit.find(unit_id)
+    if not u then return nil end
+    local ok_s, squad_id = pcall(function() return u.military.squad_id end)
+    if not ok_s or not squad_id or squad_id < 0 then return nil end
+
     local rooms = self.room_category['barracks']
-    if not rooms then return end
-    for _, r in ipairs(rooms) do
-        if r.squad_id == squad_id then
-            return r:dfbuilding()
+    if not rooms then return nil end
+    local r
+    for _, rr in ipairs(rooms) do
+        if rr.squad_id == squad_id then r = rr break end
+    end
+    if not r then
+        for _, rr in ipairs(rooms) do
+            if rr.squad_id < 0 then
+                r = rr
+                r.squad_id = squad_id
+                self:wantdig(r, -2)
+                self:_log('squad ' .. squad_id .. ' assigned a barracks')
+                break
+            end
         end
     end
+    if not r then return nil end
+
+    -- squad room use flags (C++ assign_barrack_squad: sleep+train+eq).
+    -- r3.8: dfhack.military.updateRoomAssignments wires BOTH sides
+    -- (zone.squad_room_info AND squad.rooms) — the manual write only
+    -- did the zone side, so the game did not register the barracks.
+    local zb = self:_ensure_room_zone(r)
+    if zb then
+        pcall(function()
+            local flags = df.squad_use_flags:new()
+            flags.sleep = true
+            flags.train = true
+            flags.indiv_eq = true
+            flags.squad_eq = true
+            dfhack.military.updateRoomAssignments(squad_id, zb.id, flags)
+            flags:delete()
+        end)
+    end
+
+    -- per-dwarf barracks furniture users
+    local wanted = { 'weapon_rack', 'armor_stand', 'bed', 'cabinet',
+        'chest', 'archery_target' }
+    for _, wtype in ipairs(wanted) do
+        local mine
+        for _, f in ipairs(r.layout) do
+            if f.type == wtype and f.users and f.users[unit_id] then
+                mine = f break
+            end
+        end
+        if not mine then
+            for _, f in ipairs(r.layout) do
+                if f.type == wtype and f.has_users
+                    and (not f.users or count_users(f) < f.has_users) then
+                    f.users = f.users or {}
+                    f.users[unit_id] = true
+                    f.ignore = false
+                    break
+                end
+            end
+        end
+    end
+
+    if r.status == 'finished' then
+        self:furnish_room(r)
+    end
+    return r
+end
+
+-- C++ Plan::freesoldierbarrack — release a soldier's per-dwarf
+-- barracks furniture users (the squad keeps the room).
+function Plan:freesoldierbarrack(unit_id)
+    for _, r in ipairs(self.room_category['barracks'] or {}) do
+        for _, f in ipairs(r.layout or {}) do
+            if f.users and f.users[unit_id] then
+                f.users[unit_id] = nil
+            end
+        end
+    end
+end
+
+-- C++ Plan:attribute_noblerooms — noble suites for position holders
+-- (office/dining/bedroom/tomb per required_* of the position)
+function Plan:attribute_noblerooms(id_list)
+    if not id_list or #id_list == 0 then return end
+    local rooms = self.room_category['nobleroom']
+    if not rooms then return end
+
+    -- free suites owned by now-removed nobles
+    local keep = {}
+    for _, uid in ipairs(id_list) do keep[uid] = true end
     for _, r in ipairs(rooms) do
-        if r.squad_id < 0 and r.status == 'finished' then
-            r.squad_id = squad_id
-            return r:dfbuilding()
+        if r.owner >= 0 and not keep[r.owner] then
+            self:set_owner(r, -1)
+        end
+    end
+
+    for _, uid in ipairs(id_list) do
+        local base
+        for _, r in ipairs(rooms) do
+            if r.owner == uid then base = r break end
+        end
+        if not base then
+            for _, r in ipairs(rooms) do
+                if r.owner < 0 then
+                    base = r
+                    self:set_owner(r, uid)
+                    break
+                end
+            end
+        end
+        if base then
+            -- claim the whole suite (same noblesuite number)
+            for _, r in ipairs(rooms) do
+                if r.noblesuite == base.noblesuite and r.owner < 0 then
+                    self:set_owner(r, uid)
+                    self:wantdig(r, -2)
+                end
+            end
+        end
+    end
+end
+
+-- C++ Plan::new_citizen — rooms for a fresh citizen: dining spot +
+-- bedroom + jail cells for citizens/10.
+function Plan:new_citizen(uid)
+    self:add_task(TASK_TYPE.check_idle)
+    self:getdiningroom(uid)
+    self:getbedroom(uid)
+
+    local pop = self.ai.population
+    local required_jail_cells = pop and math.floor(pop:citizen_count() / 10) or 0
+    if required_jail_cells > 0 then
+        for _, r in ipairs(self.room_category['jail'] or {}) do
+            if r.status ~= 'plan' then
+                for _, f in ipairs(r.layout) do
+                    if (f.type == 'cage' or f.type == 'restraint')
+                        and required_jail_cells > 0 then
+                        if f.ignore then
+                            f.ignore = false
+                            if r.status == 'finished' then
+                                self:furnish_room(r)
+                            end
+                        end
+                        required_jail_cells = required_jail_cells - 1
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- C++ Plan::del_citizen — free the bedroom/dining spot of a lost dwarf
+function Plan:del_citizen(uid)
+    for _, r in ipairs(self.room_category['bedroom'] or {}) do
+        if r.owner == uid then
+            self:set_owner(r, -1)
+        end
+    end
+    for _, r in ipairs(self.room_category['dininghall'] or {}) do
+        for _, f in ipairs(r.layout) do
+            if f.users and f.users[uid] then
+                f.users[uid] = nil
+            end
+        end
+    end
+    for _, r in ipairs(self.room_category['farmplot'] or {}) do
+        if r.users and r.users[uid] then
+            r.users[uid] = nil
+        end
+    end
+    for _, r in ipairs(self.room_category['barracks'] or {}) do
+        for _, f in ipairs(r.layout) do
+            if f.users and f.users[uid] then
+                f.users[uid] = nil
+            end
+        end
+    end
+end
+
+-- C++ room::low_grass — a pasture is exhausted when fewer than 20% of
+-- its tiles still carry grass (GRASS_LIGHT / GRASS_DARK materials).
+local function pasture_low_grass(r)
+    local w = (r.max.x - r.min.x) + 1
+    local h = (r.max.y - r.min.y) + 1
+    local total = w * h
+    if total <= 0 then return true end
+    local grass = 0
+    local TM = df.tiletype_material
+    for dx = 0, w - 1 do
+        for dy = 0, h - 1 do
+            local ok, tt = pcall(dfhack.maps.getTileType,
+                r.min.x + dx, r.min.y + dy, r.min.z)
+            if ok and tt ~= nil then
+                local okm, mat = pcall(function()
+                    return df.tiletype.attrs[tt].material
+                end)
+                if okm and (mat == TM.GRASS_LIGHT or mat == TM.GRASS_DARK) then
+                    grass = grass + 1
+                end
+            end
+        end
+    end
+    return grass < math.floor(total / 5)
+end
+
+-- grazing pressure of a unit (C++: 11*11*1000/grazer; non-grazers are
+-- effectively free — their grazer is 0 → pcall-guarded to a huge value)
+local function grazing_pressure(unit)
+    local ok, p = pcall(function()
+        local race = df.creature_raw.find(unit.race)
+        local caste = race and race.caste[unit.caste]
+        local grazer = caste and caste.misc.grazer or 0
+        if grazer <= 0 then return math.huge end
+        return 11 * 11 * 1000 / grazer
+    end)
+    return ok and p or math.huge
+end
+
+local function unit_is_grazer(unit)
+    local ok, p = pcall(function()
+        local race = df.creature_raw.find(unit.race)
+        local caste = race and race.caste[unit.caste]
+        return caste and (caste.misc.grazer or 0) > 0 or false
+    end)
+    return ok and p or false
+end
+
+-- C++ Plan::getpasture — capacity-managed pasture assignment. Each
+-- pasture holds grazing pressure < 1000 (a grazer 1000 animal costs
+-- 121; ~8 large grazers per 11x11 pasture). Returns the zone building
+-- or nil.
+function Plan:getpasture(pet_id)
+    local pet = df.unit.find(pet_id)
+    if not pet then return nil end
+
+    -- already assigned to one of OUR pastures? (keep it unless the
+    -- grass ran out — then the pet is released to find a fresh field)
+    local ok_r, cur_zone = pcall(function()
+        local ref = dfhack.units.getGeneralRef(pet,
+            df.general_ref_type.BUILDING_CIVZONE_ASSIGNED)
+        return ref and ref:getBuilding() or nil
+    end)
+    if ok_r and cur_zone then
+        for _, r in ipairs(self.room_category['pasture'] or {}) do
+            if r.bld_id == cur_zone.id then
+                if pasture_low_grass(r) then
+                    r.users = r.users or {}
+                    r.users[pet_id] = nil
+                else
+                    return cur_zone
+                end
+            end
+        end
+    end
+
+    local pressure = grazing_pressure(pet)
+    if pressure == math.huge then return nil end
+    local limit = 1000 - pressure
+
+    for _, r in ipairs(self.room_category['pasture'] or {}) do
+        if r.status ~= 'plan' and not pasture_low_grass(r) then
+            local sum = 0
+            for uid in pairs(r.users or {}) do
+                local u = df.unit.find(uid)
+                if u then
+                    sum = sum + grazing_pressure(u)
+                end
+            end
+            if sum < limit then
+                r.users = r.users or {}
+                r.users[pet_id] = true
+                if not r.bld_id or r.bld_id < 0 then
+                    self:construct_room(r)
+                end
+                local bld = r.bld_id and self:_find_building(r.bld_id) or nil
+                return bld
+            end
         end
     end
     return nil
 end
 
-function Plan:getpasture(pet_id)
-    local rooms = self.room_category['pasture']
-    if not rooms then return end
-    for _, r in ipairs(rooms) do
-        if r.status == 'finished' then
-            return r:dfbuilding()
+-- C++ Plan::freepasture
+function Plan:freepasture(pet_id)
+    for _, r in ipairs(self.room_category['pasture'] or {}) do
+        if r.users and r.users[pet_id] then
+            r.users[pet_id] = nil
         end
     end
-    return nil
+end
+
+-- C++ Plan::pastures_ready — true when every non-plan pasture has its
+-- zone building; kicks off digging for still-planned pastures.
+function Plan:pastures_ready()
+    local any_dig = false
+    for _, r in ipairs(self.room_category['pasture'] or {}) do
+        if r.status ~= 'plan' then
+            if not r.bld_id or r.bld_id < 0
+                or not self:_find_building(r.bld_id) then
+                return false
+            end
+        end
+    end
+    for _, r in ipairs(self.room_category['pasture'] or {}) do
+        if r.status == 'plan' then
+            r.queue = -4
+            self:wantdig(r, -4)
+            any_dig = true
+        end
+    end
+    return not any_dig
 end
 
 -- ============================================================

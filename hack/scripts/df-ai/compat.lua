@@ -288,6 +288,11 @@ function compat.create_order(opts)
     if opts.reaction_name then
         order.reaction_name = opts.reaction_name
     end
+    -- r3.8: memorial slabs carry the ghost's histfig id (C++
+    -- manager_order_template.hist_figure_id)
+    if opts.hist_figure_id and opts.hist_figure_id >= 0 then
+        pcall(function() order.hist_figure_id = opts.hist_figure_id end)
+    end
     order.amount_left = opts.amount or 1
     order.amount_total = opts.amount or 1
     order.id = compat.get_next_order_id()

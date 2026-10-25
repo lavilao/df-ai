@@ -556,10 +556,12 @@ do
     q:startup()
     check(q.builder_started == true, 'successful setup starts the builder')
     check(q.setup_done == false, 'setup_done waits for builder completion')
-    -- simulate the builder finishing on the next update
+    -- simulate the builder finishing on the next step_builder call
+    -- (r3.8: Plan:update no longer steps the builder — the dedicated
+    -- time-budgeted driver Plan:step_builder does)
     q.builder = {
         done = false,
-        step = function(self) self.done = true end,
+        step_ms = function(self) self.done = true end,
         result = function(self)
             local rm = { type = 'corridor', min = {x=0,y=0,z=0}, max = {x=1,y=1,z=0},
                 layout = {}, accesspath = {}, owner = -1, squad_id = -1, queue = 0,
@@ -569,6 +571,8 @@ do
         end,
     }
     q:update()
+    check(q.setup_done == false, 'plan update does NOT step the builder (r3.8)')
+    q:step_builder()
     check(q.setup_done == true, 'builder completion sets setup_done')
     local has_check, has_idle = false, false
     for _, t in ipairs(q.tasks_generic) do
@@ -697,8 +701,33 @@ do
     local ok_cr2 = pcall(function() pop:update_crimes() end)
     check(ok_cr2, 'second call uses the cached probe (no crash)')
 
-    -- nobles: entity with 53.16 assignments_by_type (e.assignments THROWS)
+    -- nobles: entity with 53.16 positions + assignments_by_type
+    -- (e.assignments THROWS — the field was removed in 53.16)
+    local EPR = {
+        HEALTH_MANAGEMENT = 25, MANAGE_PRODUCTION = 26, ACCOUNTING = 27,
+        LAW_ENFORCEMENT = 28, EXECUTIONS = 29, TRADE = 30,
+    }
+    df_mock.entity_position_responsibility = EPR
+
     local entity = make_struct({
+        positions = {
+            own = {
+                { id = 1, required_office = 1, required_dining = 0,
+                    required_tomb = 1,
+                    responsibilities = { [EPR.MANAGE_PRODUCTION] = true } },
+                { id = 2, required_office = 0, required_dining = 0,
+                    required_tomb = 0,
+                    responsibilities = { [EPR.ACCOUNTING] = true } },
+                { id = 3, required_office = 1, required_dining = 1,
+                    required_tomb = 0,
+                    responsibilities = { [EPR.TRADE] = true } },
+            },
+            assignments = {
+                { id = 10, position_id = 1, histfig = 5, histfig2 = 5 },
+                { id = 11, position_id = 2, histfig = -1, histfig2 = -1 },
+                { id = 12, position_id = 3, histfig = 7, histfig2 = 7 },
+            },
+        },
         assignments_by_type = dfvec({
             dfvec({ { histfig = 5, position_id = 1 }, { histfig = -1, position_id = 2 } }),
             dfvec({ { histfig = 7, position_id = 3 } }),
@@ -716,11 +745,25 @@ do
     check(ok_a and type(flat) == 'table' and #flat == 3,
         'assignments_by_type flattened to 3 entries (got ' .. tostring(ok_a and #flat) .. ')')
 
-    pop.ai.plan = { getbedroom = function() return { room = true } end }
+    -- r3.8: update_nobles follows the C++ flow — nobles detected via
+    -- ent.positions, apartments attributed through plan's hook
+    local attributed
+    pop.ai.plan = {
+        getbedroom = function() return { room = true } end,
+        attribute_noblerooms = function(_, ids) attributed = ids end,
+        room_category = {},
+    }
     local ok_nb = pcall(function() pop:update_nobles() end)
     check(ok_nb, 'update_nobles survives the removed .assignments field')
-    check(pop.noble_rooms[105] and pop.noble_rooms[107],
-        'noble bedrooms assigned via flattened assignments (units 105, 107)')
+    local got_105, got_107 = false, false
+    if attributed then
+        for _, uid in ipairs(attributed) do
+            if uid == 105 then got_105 = true end
+            if uid == 107 then got_107 = true end
+        end
+    end
+    check(got_105 and got_107,
+        'noble apartments attributed to units 105, 107 via plan hook')
 
     df_mock.global.plotinfo = saved_plotinfo
 end
@@ -1013,6 +1056,78 @@ do
         'furniture dig designation applied to wall tile')
 
     dfhack_mock.maps.getTileBlock = old_getTileBlock
+end
+
+-- ============================================================
+-- 15. r3.8 regressions: construct dispatch + v50 API names
+--     (all found live on DF 53.16-r3 by the q14 probe + arena E2E)
+-- ============================================================
+print('--- r3.8: construct dispatch + v50 API names ---')
+do
+    local ok_r, rooms_mod_r = pcall(dfhack_mock.run_script_with_env, nil, 'df-ai/rooms', { module = true })
+    local ok_p, Plan = pcall(dfhack_mock.run_script_with_env, nil, 'df-ai/plan', { module = true })
+    check(ok_p and ok_r, 'plan + rooms modules load for r3.8 checks')
+
+    if ok_p and ok_r then
+        -- (1) every construct_* task type dispatches to a REAL Plan
+        -- method. The r3.8 bug passed self.try_construct_construct_X
+        -- (doubled prefix) = nil -> every stockpile/workshop construct
+        -- task crashed with "attempt to call a nil value" (10 failures
+        -- in the arena log before the fix).
+        local pl = Plan.new({})
+        for _, tt in ipairs({ 'construct_workshop', 'construct_furnace',
+                'construct_stockpile', 'construct_farmplot',
+                'construct_activityzone', 'construct_tradedepot',
+                'construct_windmill' }) do
+            local method_name = 'try_construct_' .. tt:gsub('^construct_', '')
+            check(type(pl[method_name]) == 'function',
+                'dispatch target Plan:' .. method_name .. ' exists')
+        end
+
+        -- (2) behavioral: a construct_stockpile task processes WITHOUT
+        -- being dropped (nil-method tasks are dropped by the queue's
+        -- pcall isolation; a dispatched-but-not-ready task survives)
+        dfhack_mock.buildings = {
+            constructBuilding = function() return nil, 'no map (mock)' end,
+        }
+        pl.setup_done = true
+        local sp = rooms_mod_r.room.new('stockpile',
+            { x = 10, y = 10, z = 5 }, { x = 12, y = 12, z = 5 },
+            { stockpile_type = 'food' })
+        sp.is_dug = function() return true end
+        pl:add_task(rooms_mod_r.TASK_TYPE.construct_stockpile, sp)
+        local ok_run, err_run = pcall(function() pl:process_tasks_generic(1) end)
+        check(ok_run, 'process_tasks_generic runs without crashing (' .. tostring(err_run) .. ')')
+        check(#pl.tasks_generic >= 1
+            and pl.tasks_generic[1].type == rooms_mod_r.TASK_TYPE.construct_stockpile,
+            'construct_stockpile task NOT dropped (dispatch resolved)')
+
+        -- (3) source-scan: known-bad v50 API names must never return.
+        -- Auto-vivifying mocks cannot catch dangling df.* names — the
+        -- live probe is the gold standard; this denylist is the CI tripwire.
+        local function src(p)
+            local fh = assert(io.open(p, 'r'))
+            local s = fh:read('*a')
+            fh:close()
+            return s
+        end
+        local s_plan = src('hack/scripts/df-ai/plan.lua')
+        local s_rooms = src('hack/scripts/df-ai/rooms.lua')
+        check(not s_plan:find('job_item_ref%.LinkTo'),
+            'no df.job_item_ref.LinkTo* refs (53.16: constants live in job_role_type)')
+        check(s_plan:find('job_role_type%.LinkToTarget') ~= nil,
+            'lever link uses df.job_role_type.LinkToTarget')
+        check(not s_plan:find('z_level') and not s_rooms:find('z_level'),
+            'no building z_level refs (v50 renamed the field to z)')
+        check(not s_plan:find("infirmary = 'Hospital'"),
+            'no Hospital civzone mapping (v50 hospitals are locations, not zones)')
+        check(not s_plan:find('try_construct_construct_'),
+            'no doubled try_construct_construct_ dispatch names')
+        check(not s_plan:find('squads_by_id') and not s_plan:find('world%.squad_next_id'),
+            'no removed squad API refs (dfhack.military.makeSquad / df.squad.find)')
+        check(s_plan:find('building_extents_type') ~= nil,
+            'civzone creation passes room.extents (quickfort zone.lua pattern)')
+    end
 end
 
 print(failures == 0 and '=== ALL UNIT TESTS PASS ==='

@@ -290,3 +290,35 @@ User report: fort works but "not very intelligent" vs the C++ original; dwarves 
 ### Known gaps (documented in docs/INFORME_ESTRATEGIAS.md §9.2)
 
 Workshops construct without material selection (C++ picks blocks→boulder→wood; construct-cap prevents loops); df.tool_use does not exist in 53.16 (nest boxes/hives/pedestals/bookcases get no filter → skipped after capped retries); makeroom extents + try_endfurnish post-build config, cistern/well system, stocks population-scaled quotas + Watch tier, military, nobles, cemetery coffins — next milestones.
+
+## Session 12 — r3.8: complete the missing strategies + live-verified v50 zone/room system
+
+### Ported (the §9.2 "known gaps" list, now closed)
+
+- **plan.lua**: C++ material-selection for constructions (blocks → non-economic boulder → wood; fire-safe for furnaces; anvil for the forge; `is_item_free` parity); `init_managed_workshop` (workshop job-queue cap 10); makeroom → v50 **civzones** (`_ensure_room_zone` with quickfort's `fields.room.extents` pattern + `assigned_unit_id`); `set_owner` via `dfhack.buildings.setOwner`; `getcoffin`/`getdiningroom`/`getsoldierbarrack`/`freesoldierbarrack` (squad rooms via `dfhack.military.updateRoomAssignments`); `attribute_noblerooms`; `new_citizen`/`del_citizen` (dining spot + bedroom on arrival, freed on death); lever system (`pull_lever`, `link_lever` with real `LinkBuildingToTrigger` jobs + 2 mechanisms, `setup_lever`); `monitor_cistern` (well/reserve gate coordination, PERSISTENT task); `furnish_check` completion phase; `Plan:step_builder` time-budgeted builder driver.
+- **population.lua**: full `update_military` (draft/dismiss policy, squad creation via `dfhack.military.makeSquad`, barracks training checks, kill-list attack orders via `squad_order_kill_listst`, uniform/equipment re-equip bitfield); `update_nobles` C++ parity (appoint manager/bookkeeper/doctor/sheriff/executioner/broker through `ent.positions` + `histfig_entity_link_positionst`, bookkeeper settings=4); `check_noble_apartments`; pets (pasture zones by grazing pressure `11*11*1000/grazer`, training assignments, war/hunter pet management); `update_petitions`; `update_locations`; `unit_totalxp`; deathwatch moved to event hooks + 25-tick sweeps.
+- **stocks.lua**: `num_needed` population-scaled quotas (C++ formula table); `queue_slab` (memorial slabs for restless ghosts); farm system (`farm_setup`, `plant_census`, seasonal plant selection by biome/usage flags, seed accounting); `trim_stalled_orders`; `queue_job_amount`; Watch-tier item gating.
+- **blueprint.lua**: `surface_tile_at` (map-top walk-down) for outdoor placement viability.
+- **df-ai.lua**: tick cadences now match the C++ original (plan 25→240, stocks 50→600, deathwatch 1→25-tick sweep + unit-death events, builder stepped every 2 ticks while active); `step_builder_watch`; version r3.8.
+
+### Live-verified API fixes (q14/q14b/q14c probes + arena E2E — all crash-class)
+
+- `df.job_item_ref.LinkToTrigger/LinkToTarget` DO NOT EXIST in 53.16 → constants live in **`df.job_role_type`** (3/4).
+- **`df.civzone_type.Hospital` is nil** — v50 hospitals are LOCATIONS (abstract buildings), not civzones. Infirmary rooms are no longer zoned (dug + furnished; the game's location system owns hospital registration). Wrong-zone MeetingHall fallback removed: rooms without a valid zone type get no zone at all.
+- `building.z_level` REMOVED in v50 → `building.z` (plan.lua + rooms.lua building lookups).
+- **Doubled dispatch names** `try_construct_construct_*` = nil → every construct_stockpile/workshop task crashed ("attempt to call a nil value", 10 failures in the first arena run).
+- `world.squad_next_id`/`world.squads_by_id` REMOVED (squads is a compound handler) → `dfhack.military.makeSquad` + `df.squad.find`.
+- civzone creation needs `fields={assigned_unit_id=-1, room={x,y,width,height,extents}}` (quickfort zone.lua pattern) — without room.extents the zone covers no tiles.
+- Zone give-up cap (10 failures/room) — the r3.6 trap-loop lesson applied to zones.
+
+### Verification
+
+- Unit tests: 121 checks (new r3.8 sections: construct dispatch targets, stockpile task not dropped, source-scan denylist for every removed-API name above, civzone extents pattern, nobles via ent.positions + attribute_noblerooms hook).
+- Live q14 probe at title: 12/12 modules, 50 enum members, 9 struct constructors with field layouts, 17 global paths, EngraveSlab manager order end-to-end.
+- Arena E2E (rock-filled, instant-dig miner emulation, 2 runs): 34 rooms/26 corridors placed; rooms advance DIG→CONSTRUCT→FURNISH→**FINISHED (23)**; 49 manager orders; 56 traps all unique; **zero df-ai task errors** (only stonesense's missing libOpenGL remains, an environment issue).
+- Production `_ensure_room_zone` verified live: bedroom zone created with 20 extents tiles, `findCivzonesAt` sees it; tomb zone created; infirmary correctly unzoned; `setOwner` round-trips.
+
+### Performance
+
+- Big-map regression: 96×96×16 rock world, 8000 placement tries → **3.31 s CPU** for 759 rooms/380 blueprints (r3.7 took minutes); builder is a resumable coroutine stepped with a time budget.
+- Tick cadences = C++ originals (the user's 240→1000 restart-cadence commit preserved).

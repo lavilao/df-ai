@@ -63,50 +63,166 @@ local function shape_family(shape)
     return 'other'
 end
 
-local function tile_data(x, y, z)
-    -- shape, material, designation, occupancy (or nil)
-    local ok, block = pcall(dfhack.maps.getTileBlock, x, y, z)
-    if not ok or not block then return nil end
-    local lx, ly = x % 16, y % 16
-    local okT, tt = pcall(function() return block.tiletype[lx][ly] end)
-    if not okT or tt == nil then return nil end
-    local okA, attrs = pcall(function() return df.tiletype.attrs[tt] end)
-    if not okA or not attrs then return nil end
-    local des, occ
-    pcall(function() des = block.designation[lx][ly] end)
-    pcall(function() occ = block.occupancy[lx][ly] end)
-    return {
-        shape = attrs.shape,
-        material = attrs.material,
-        des = des,
-        occ = occ,
-    }
+-- ============================================================
+-- Fast tile access (r3.8 perf rework)
+--
+-- The r3.7 engine read every tile through tile_data(): 5 pcalls +
+-- ~7 DFHack boundary crossings per tile, plus a full z-column walk
+-- (map top -> surface) for EVERY outdoor candidate tile. On a real
+-- 192x192 map that averaged 1-30 ms PER PLACEMENT TRY; with up to
+-- 8000 tries the layout blocked the main thread for minutes
+-- ("el juego se congela apenas activo df-ai").
+--
+-- r3.8 keeps the exact same checks but:
+--   * caches map blocks (one getTileBlock call per block, ever)
+--   * precomputes tiletype -> shape/material Lua tables (no per-tile
+--     attrs struct fetch, no pcall in the hot path)
+--   * memoizes the surface column scan per (x, y)
+--   * yields to the host on a wall-clock budget (~3 ms slices) so the
+--     driver spreads layout work across frames
+-- ============================================================
+
+local function now_ms()
+    if dfhack and dfhack.getTickCount then
+        local ok, v = pcall(dfhack.getTickCount)
+        if ok and type(v) == 'number' then return v end
+    end
+    return math.floor(os.clock() * 1000)
 end
 
--- C++ Plan::surface_tile_at: walk down from the map top for the first
--- Floor/Ramp (skips open air, rejects pools/rivers, allows tree tops).
-local function surface_tile_at(x, y, z_top, allow_trees)
-    local TTM = df.tiletype_material
-    local tree = false
-    for z = z_top, 0, -1 do
-        local td = tile_data(x, y, z)
-        if td then
-            local family = shape_family(td.shape)
-            if family == 'open' then
-                -- keep descending
-            elseif td.material == TTM.POOL or td.material == TTM.RIVER then
-                return nil
-            elseif td.material == TTM.TREE then
-                tree = true
-            elseif family == 'floor' then
-                return { x = x, y = y, z = z }
-            elseif tree then
-                if not allow_trees then return nil end
-                return { x = x, y = y, z = z + 1 }
+-- tiletype number -> shape / material (built once per session).
+-- Real DFHack enums expose _first_item.._last_item; the unit-test
+-- mocks are plain tables (pairs works). If neither works we fall
+-- back to per-tile df.tiletype.attrs reads (the r3.7 behavior).
+local SHAPE_OF, MAT_OF
+local function ensure_tt_tables()
+    if SHAPE_OF ~= nil then return end
+    local attrs = df.tiletype and df.tiletype.attrs
+    if not attrs then return end
+    SHAPE_OF, MAT_OF = {}, {}
+    local ok = pcall(function()
+        if df.tiletype._last_item ~= nil then
+            local lo = df.tiletype._first_item or 0
+            local hi = df.tiletype._last_item
+            for tt = lo, hi do
+                local a = attrs[tt]
+                if a then
+                    SHAPE_OF[tt] = a.shape
+                    MAT_OF[tt] = a.material
+                end
+            end
+        else
+            for tt, a in pairs(attrs) do
+                SHAPE_OF[tt] = a.shape
+                MAT_OF[tt] = a.material
             end
         end
+    end)
+    if not ok or next(SHAPE_OF) == nil then
+        SHAPE_OF, MAT_OF = nil, nil
     end
-    return nil
+end
+
+local function tt_shape(tt)
+    if SHAPE_OF then return SHAPE_OF[tt] end
+    local a = df.tiletype.attrs[tt]
+    return a and a.shape or nil
+end
+
+local function tt_material(tt)
+    if MAT_OF then return MAT_OF[tt] end
+    local a = df.tiletype.attrs[tt]
+    return a and a.material or nil
+end
+
+-- map block cache: layout is read-only planning (digging happens
+-- later), so blocks cannot change while a build runs. One
+-- getTileBlock boundary call per block, ever.
+local BCACHE = {}
+local function reset_block_cache()
+    BCACHE = {}
+end
+
+local function block_at(x, y, z)
+    local bx = x // 16
+    local row = BCACHE[bx]
+    if row == nil then row = {}; BCACHE[bx] = row end
+    local by = y // 16
+    local col = row[by]
+    if col == nil then col = {}; row[by] = col end
+    local b = col[z]
+    if b == nil then
+        b = dfhack.maps.getTileBlock(x, y, z)
+        if not b then b = false end
+        col[z] = b
+    end
+    return b or nil
+end
+
+-- per-tile probes for the hot loops: no pcall, no table allocation
+local function tile_shape_mat(x, y, z)
+    local b = block_at(x, y, z)
+    if not b then return nil, nil end
+    local tt = b.tiletype[x % 16][y % 16]
+    if tt == nil then return nil, nil end
+    return tt_shape(tt), tt_material(tt)
+end
+
+local function tile_has_building(x, y, z)
+    local b = block_at(x, y, z)
+    if not b then return false end
+    local occ = b.occupancy[x % 16][y % 16]
+    if occ == nil then return false end
+    local v = occ.building
+    if v == nil then return false end
+    if type(v) == 'boolean' then return v end
+    return v ~= 0
+end
+
+local function tile_flow_size(x, y, z)
+    local b = block_at(x, y, z)
+    if not b then return 0 end
+    local des = b.designation[x % 16][y % 16]
+    return des and des.flow_size or 0
+end
+
+-- ---- time-sliced yielding ----------------------------------------
+-- One build = thousands of tries, each reading hundreds of tiles.
+-- The builder coroutine yields after ~SLICE_MS of work so the host
+-- (Plan:update / the frame driver in df-ai.lua) can spread the
+-- layout across frames without ever stalling one frame for long.
+local SLICE_MS = 3
+local PROGRESS = { tries = 0, placed = 0 }
+local YSTATE = { active = false, n = 0, t0 = nil }
+
+local function slice_begin()
+    YSTATE.active = true
+    YSTATE.n = 0
+    YSTATE.t0 = nil
+end
+
+local function slice_end()
+    YSTATE.active = false
+end
+
+-- counting gate: check the clock every `every` calls, yield when the
+-- current work slice is exhausted (no-op outside the coroutine)
+local function work(every)
+    if not YSTATE.active then return end
+    YSTATE.n = YSTATE.n + 1
+    if YSTATE.n < every then return end
+    YSTATE.n = 0
+    local now = now_ms()
+    if YSTATE.t0 == nil then
+        YSTATE.t0 = now
+        return
+    end
+    if now - YSTATE.t0 >= SLICE_MS then
+        if coroutine.isyieldable() then
+            coroutine.yield(PROGRESS.tries)
+        end
+        YSTATE.t0 = now_ms()
+    end
 end
 
 local function key(x, y, z) return x .. ',' .. y .. ',' .. z end
@@ -309,6 +425,7 @@ function M.load_all()
 
     local variants = {}
     for _, base in ipairs(bases) do
+        work(16)
         local tdir, tfiles = dir_variants('templates', base)
         local idir, ifiles = dir_variants('instances', base)
         if tdir then
@@ -348,6 +465,7 @@ local function build_cache(rb)
     local DIG = df.tile_dig_designation
 
     for _, r in ipairs(rb.r) do
+        work(4)
         if (r.noblesuite or -1) > cache.max_noblesuite then
             cache.max_noblesuite = r.noblesuite or -1
         end
@@ -444,6 +562,18 @@ local function build_cache(rb)
             end
         end
     end
+    -- r3.8: pre-parsed NUMERIC offsets for the hot add()/can_add_room()
+    -- loops (string match + tonumber per entry per placement was a
+    -- serious tax once a fort grows past a few hundred rooms)
+    for _, setname in ipairs({ 'corridor', 'interior', 'no_room', 'no_corridor' }) do
+        local set = cache[setname]
+        local out = {}
+        for k in pairs(set) do
+            local x, y, z = k:match('^(-?%d+),(-?%d+),(-?%d+)$')
+            out[#out + 1] = { tonumber(x), tonumber(y), tonumber(z) }
+        end
+        cache[setname .. '_off'] = out
+    end
     rb.cache = cache
     return cache
 end
@@ -454,6 +584,62 @@ end
 
 local Placer = {}
 Placer.__index = Placer
+
+-- C++ Plan::surface_tile_at: walk down from the map top for the first
+-- Floor/Ramp (skips open air, rejects pools/rivers, allows tree tops).
+-- r3.8: the result is MEMOIZED per (x, y) column on the placer — the
+-- walk itself was the single most expensive operation of the r3.7
+-- engine (up to ~150 tile reads per outdoor candidate tile).
+-- Result encoding: false = blocked (pool/river/no ground),
+-- { z = .., on_tree = bool } — on_tree mirrors the original
+-- allow_trees gate (standing ON tree canopy vs. real ground).
+function Placer:_compute_surface(x, y)
+    local TTM = df.tiletype_material
+    local tree = false
+    for z = self.z_top, 0, -1 do
+        local b = block_at(x, y, z)
+        if b then
+            local tt = b.tiletype[x % 16][y % 16]
+            if tt ~= nil then
+                local family = shape_family(tt_shape(tt))
+                local material = tt_material(tt)
+                if family == 'open' then
+                    -- keep descending
+                elseif material == TTM.POOL or material == TTM.RIVER then
+                    return false
+                elseif material == TTM.TREE then
+                    tree = true
+                elseif family == 'floor' then
+                    return { z = z, on_tree = tree }
+                elseif tree then
+                    return { z = z + 1, on_tree = true }
+                end
+            end
+        end
+    end
+    return false
+end
+
+function Placer:_surface_info(x, y)
+    local sx = self.surface[x]
+    if sx == nil then
+        sx = {}
+        self.surface[x] = sx
+    end
+    local r = sx[y]
+    if r == nil then
+        r = self:_compute_surface(x, y)
+        sx[y] = r
+    end
+    return r
+end
+
+function Placer:surface_tile(x, y, allow_trees)
+    local r = self:_surface_info(x, y)
+    if not r then return nil end
+    if r.on_tree and not allow_trees then return nil end
+    return { x = x, y = y, z = r.z }
+end
 
 function Placer.new(opts)
     local o = {
@@ -466,38 +652,59 @@ function Placer.new(opts)
         wagon_tiles = opts.wagon_tiles or {},  -- exempt from building checks
         corridor = {}, interior = {}, no_room = {}, no_corridor = {},
         room_connect = {},  -- [abskey] = { room = record, tags = {tag,...} }
+        by_tag = {},        -- [tag] = { { room = rec, ak = key }, ... } (r3.8)
+        surface = {},       -- [x][y] -> memoized surface column info (r3.8)
         placed = {},        -- list of placed blueprint instances
         rooms = {},         -- flat list of room RECORDS (index + 1 = C++ index)
         counts = {},
         instance_counts = {},
         next_noblesuite = 0,
         tries = 0,
+        connect_gen = 0,    -- r3.8: connect-candidate cache generation
     }
     setmetatable(o, Placer)
+    ensure_tt_tables()
     -- precompute caches once
     for _, rb in ipairs(o.variants) do build_cache(rb) end
     return o
 end
 
 -- PlanSetup::add — collision test + global set merge + exit registry
+-- r3.8: iterates pre-parsed NUMERIC offsets (the r3.7 string
+-- match + tonumber + re-concat per cache entry per placement was a
+-- serious tax once the fort grew past a few hundred rooms).
 function Placer:add(rb, pos, parent_record)
+    work(1)
     local cache = rb.cache
     local px, py, pz = pos.x, pos.y, pos.z
-    local function abs(k)
-        local x, y, z = k:match('^(-?%d+),(-?%d+),(-?%d+)$')
-        return key(px + tonumber(x), py + tonumber(y), pz + tonumber(z))
+    local offs
+    offs = cache.corridor_off
+    for i = 1, #offs do
+        local o = offs[i]
+        if self.no_corridor[key(px + o[1], py + o[2], pz + o[3])] then
+            return false, 'corridor hits no_corridor'
+        end
     end
-    for k in pairs(cache.corridor) do
-        if self.no_corridor[abs(k)] then return false, 'corridor hits no_corridor' end
+    offs = cache.interior_off
+    for i = 1, #offs do
+        local o = offs[i]
+        if self.no_room[key(px + o[1], py + o[2], pz + o[3])] then
+            return false, 'interior hits no_room'
+        end
     end
-    for k in pairs(cache.interior) do
-        if self.no_room[abs(k)] then return false, 'interior hits no_room' end
+    offs = cache.no_corridor_off
+    for i = 1, #offs do
+        local o = offs[i]
+        if self.corridor[key(px + o[1], py + o[2], pz + o[3])] then
+            return false, 'no_corridor hits corridor'
+        end
     end
-    for k in pairs(cache.no_corridor) do
-        if self.corridor[abs(k)] then return false, 'no_corridor hits corridor' end
-    end
-    for k in pairs(cache.no_room) do
-        if self.interior[abs(k)] then return false, 'no_room hits interior' end
+    offs = cache.no_room_off
+    for i = 1, #offs do
+        local o = offs[i]
+        if self.interior[key(px + o[1], py + o[2], pz + o[3])] then
+            return false, 'no_room hits interior'
+        end
     end
 
     local room_base = #self.rooms
@@ -537,7 +744,11 @@ function Placer:add(rb, pos, parent_record)
         table.insert(inst.rooms, rec)
     end
 
-    -- register exits (skip tiles blocked by existing no_room)
+    -- register exits (skip tiles blocked by existing no_room);
+    -- r3.8: also bucket them by tag for O(1) random exit picks in the
+    -- connect phase (try_add_connect previously scanned EVERY live
+    -- exit on EVERY try — O(exits) per try, tens of millions of
+    -- iterations on a big fort)
     for _, rec in ipairs(inst.rooms) do
         for _, e in ipairs(rec.data.exits or {}) do
             local ak = key(rec.min.x + e[2], rec.min.y + e[3], rec.min.z + e[4])
@@ -548,6 +759,12 @@ function Placer:add(rb, pos, parent_record)
                     self.room_connect[ak] = conn
                 end
                 table.insert(conn.tags, e[1])
+                local bucket = self.by_tag[e[1]]
+                if bucket == nil then
+                    bucket = {}
+                    self.by_tag[e[1]] = bucket
+                end
+                table.insert(bucket, { room = rec, ak = ak })
             end
         end
     end
@@ -556,14 +773,18 @@ function Placer:add(rb, pos, parent_record)
     local src = rb.type .. '/' .. rb.tmpl_name .. '/' .. rb.name
     for _, setname in ipairs({ 'corridor', 'interior', 'no_room', 'no_corridor' }) do
         local global = self[setname]
-        for k in pairs(cache[setname]) do
-            global[abs(k)] = src
+        offs = cache[setname .. '_off']
+        for i = 1, #offs do
+            local o = offs[i]
+            global[key(px + o[1], py + o[2], pz + o[3])] = src
         end
     end
 
     -- dead exits: exits covered by the new blueprint's no_room
-    for k in pairs(cache.no_room) do
-        local ak = abs(k)
+    offs = cache.no_room_off
+    for i = 1, #offs do
+        local o = offs[i]
+        local ak = key(px + o[1], py + o[2], pz + o[3])
         if self.room_connect[ak] then self.room_connect[ak] = nil end
     end
 
@@ -586,18 +807,21 @@ function Placer:add(rb, pos, parent_record)
     self.instance_counts[rb.type] = self.instance_counts[rb.type] or {}
     self.instance_counts[rb.type][rb.name] =
         (self.instance_counts[rb.type][rb.name] or 0) + 1
+    -- r3.8: invalidate the connect-phase candidate cache
+    self.connect_gen = (self.connect_gen or 0) + 1
 
     return true
 end
 
 -- PlanSetup::can_add_room — map viability (bounds / rock / water / ...)
+-- r3.8: wall-clock-sliced (work() yields every ~SLICE_MS of scanning)
+-- and pcall-free via the cached tile probes. Check ORDER inside the
+-- rock scan was rearranged (shape before liquid) so rejecting a
+-- candidate reads no designation at all — every r3.7 rejection
+-- condition is still evaluated, just cheaper.
 function Placer:can_add_room(rb, pos)
     self.tries = self.tries + 1
-    -- resumable: yield to the host every `yield_every` tries so a big map
-    -- never freezes the game (the C++ spread setup over ticks the same way)
-    if self.yield_every and self.tries % self.yield_every == 0 then
-        coroutine.yield(self.tries)
-    end
+    PROGRESS.tries = self.tries
     local px, py, pz = pos.x, pos.y, pos.z
     local mw, mh, md = self.map.x, self.map.y, self.map.z
     local TTM = df.tiletype_material
@@ -607,9 +831,10 @@ function Placer:can_add_room(rb, pos)
     end
 
     -- bounds: every no_room tile must be a valid tile
-    for k in pairs(rb.cache.no_room) do
-        local x, y, z = k:match('^(-?%d+),(-?%d+),(-?%d+)$')
-        if not in_bounds(px + tonumber(x), py + tonumber(y), pz + tonumber(z)) then
+    local offs = rb.cache.no_room_off
+    for i = 1, #offs do
+        local o = offs[i]
+        if not in_bounds(px + o[1], py + o[2], pz + o[3]) then
             return false
         end
     end
@@ -626,16 +851,17 @@ function Placer:can_add_room(rb, pos)
             for x = rmin.x, rmax.x do
                 for y = rmin.y, rmax.y do
                     for z = rmin.z, rmax.z do
-                        local td = tile_data(x, y, z)
-                        if not td then return false end
-                        if shape_family(td.shape) == 'wall' and td.material ~= TTM.TREE then
+                        work(8)
+                        local shape, material = tile_shape_mat(x, y, z)
+                        if shape == nil then return false end
+                        if shape_family(shape) == 'wall' and material ~= TTM.TREE then
                             return false -- underground
                         end
                         if r.require_floor ~= false then
-                            local s = surface_tile_at(x, y, self.z_top, true)
+                            local s = self:surface_tile(x, y, true)
                             if not s or s.z ~= z then return false end
                         end
-                        if td.occ and td.occ.building and td.occ.building ~= 0
+                        if tile_has_building(x, y, z)
                             and not self.wagon_tiles[key(x, y, z)] then
                             return false -- building present
                         end
@@ -651,9 +877,10 @@ function Placer:can_add_room(rb, pos)
                     local tx, ty, tz = rmin.x + f.x, rmin.y + f.y, rmin.z + (f.z or 0)
                     for dx = -1, 1 do
                         for dy = -1, 1 do
-                            local td = tile_data(tx + dx, ty + dy, tz - 1)
-                            if not td or shape_family(td.shape) ~= 'wall'
-                                or td.material == TTM.TREE then
+                            work(8)
+                            local shape, material = tile_shape_mat(tx + dx, ty + dy, tz - 1)
+                            if shape == nil or shape_family(shape) ~= 'wall'
+                                or material == TTM.TREE then
                                 return false
                             end
                         end
@@ -664,20 +891,22 @@ function Placer:can_add_room(rb, pos)
             for x = rmin.x - 1, rmax.x + 1 do
                 for y = rmin.y - 1, rmax.y + 1 do
                     for z = rmin.z, rmax.z + 1 do
-                        local td = tile_data(x, y, z)
-                        if not td then return false end
-                        if td.des and td.des.flow_size > 0 then return false end
-                        if td.material == TTM.POOL or td.material == TTM.RIVER
-                            or td.material == TTM.BROOK then
+                        work(16)
+                        local shape, material = tile_shape_mat(x, y, z)
+                        if shape == nil then return false end
+                        if material == TTM.POOL or material == TTM.RIVER
+                            or material == TTM.BROOK then
                             return false
                         end
                         if z == rmax.z + 1 then
-                            -- only water checked above the room
+                            -- above the room only liquid matters
+                            if tile_flow_size(x, y, z) > 0 then return false end
                         else
-                            if shape_family(td.shape) ~= 'wall' or td.material == TTM.TREE then
+                            if shape_family(shape) ~= 'wall' or material == TTM.TREE then
                                 return false -- above ground / open cavern
                             end
-                            if td.occ and td.occ.building and td.occ.building ~= 0
+                            if tile_flow_size(x, y, z) > 0 then return false end
+                            if tile_has_building(x, y, z)
                                 and not self.wagon_tiles[key(x, y, z)] then
                                 return false
                             end
@@ -787,7 +1016,7 @@ function Placer:try_add_start(rb)
     for _, off in ipairs(candidates) do
         local x, y = entrance.x + off[1], entrance.y + off[2]
         if x >= 3 and y >= 3 and x < self.map.x - 3 and y < self.map.y - 3 then
-            local pos = surface_tile_at(x, y, self.z_top, true)
+            local pos = self:surface_tile(x, y, true)
             if pos and self:can_add_room(rb, pos) then
                 local ok = self:add(rb, pos, nil)
                 if ok then
@@ -806,7 +1035,7 @@ function Placer:try_add_outdoor(rb)
     for _ = 1, 10 do
         local x = math.random(2, self.map.x - 3)
         local y = math.random(2, self.map.y - 3)
-        local pos = surface_tile_at(x, y, self.z_top, true)
+        local pos = self:surface_tile(x, y, true)
         if pos and self:can_add_room(rb, pos) then
             local ok = self:add(rb, pos, nil)
             if ok then
@@ -821,6 +1050,8 @@ end
 
 -- Phase 3: connect — anchor a random variant on a random live exit
 -- whose tag matches the variant type (through plan.tags expansion)
+-- r3.8: uses the by_tag exit buckets (O(bucket) pick instead of a full
+-- room_connect scan per try). Dead rooms are filtered lazily here.
 function Placer:try_add_connect(rb)
     local tags = { [rb.type] = true }
     for t, exp in pairs(self.plan.tags or {}) do
@@ -828,23 +1059,40 @@ function Placer:try_add_connect(rb)
             if t2 == rb.type then tags[t] = true break end
         end
     end
-    local connectors = {}
-    for ak, conn in pairs(self.room_connect) do
-        if not conn.room.removed then
-            for _, t in ipairs(conn.tags) do
-                if tags[t] then
-                    table.insert(connectors, { conn.room, ak })
-                    break
+    -- r3.8: candidate list cached per tag-signature and invalidated on
+    -- every successful add() (self.connect_gen). Rebuilding the list per
+    -- try was O(live exits) per try — tens of millions of iterations on
+    -- a big fort.
+    local sig = rb.type
+    local cache = self._cc_cache
+    if not cache or cache.gen ~= self.connect_gen or cache.sig ~= sig then
+        local candidates = {}
+        local seen = {}
+        for t in pairs(tags) do
+            local bucket = self.by_tag[t]
+            if bucket then
+                for _, e in ipairs(bucket) do
+                    if not e.room.removed and not seen[e.ak] then
+                        seen[e.ak] = true
+                        table.insert(candidates, e)
+                    end
                 end
             end
         end
+        cache = { gen = self.connect_gen, sig = sig, list = candidates }
+        self._cc_cache = cache
     end
-    if #connectors == 0 then return false end
-    local chosen = connectors[math.random(#connectors)]
-    local x, y, z = chosen[2]:match('^(-?%d+),(-?%d+),(-?%d+)$')
+    local candidates = cache.list
+    if #candidates == 0 then return false end
+    -- dead-room filtering happens lazily here (cheap): the cache can
+    -- hold entries whose room died in remove_unused_rooms — but that
+    -- pass only runs at the very end of build, so during the connect
+    -- phase every cached entry is live.
+    local chosen = candidates[math.random(#candidates)]
+    local x, y, z = chosen.ak:match('^(-?%d+),(-?%d+),(-?%d+)$')
     local pos = { x = tonumber(x), y = tonumber(y), z = tonumber(z) }
     if self:can_add_room(rb, pos) then
-        local ok = self:add(rb, pos, chosen[1])
+        local ok = self:add(rb, pos, chosen.room)
         if ok then
             self.log('placed ' .. rb.type .. '/' .. rb.tmpl_name .. '/'
                 .. rb.name .. ' at ' .. pos.x .. ',' .. pos.y .. ',' .. pos.z)
@@ -1049,6 +1297,12 @@ function M.instantiate(placer, rooms_module)
             rm.room_record = rec
             rec2room[rec] = rm
 
+            -- r3.8: per-INSTANCE map of merged-furniture-index -> created
+            -- furniture object. Levers reference their floodgate through
+            -- "target" (an index into the SAME variant's f array, possibly
+            -- in a sibling room) — resolved right after this loop.
+            rec._fmap = {}
+
             for _, fi in ipairs(rec.data.layout or {}) do
                 local f = rec.rb.f[fi + 1]
                 if f then
@@ -1070,11 +1324,30 @@ function M.instantiate(placer, rooms_module)
                             stairs_special = f.stairs_special or false,
                             target_idx = f.target,
                         })
+                    rec._fmap[fi] = fobj
                     table.insert(rm.layout, fobj)
                 end
             end
             table.insert(rooms, rm)
             if rm.type == 'corridor' then table.insert(corridors, rm) end
+        end
+    end
+
+    -- r3.8: resolve lever targets within each placed instance (the
+    -- well/cistern templates: lever.target -> floodgate furniture, both
+    -- created from the same merged variant; the target may live in a
+    -- sibling room of the same instance)
+    for _, rec in ipairs(placer.rooms) do
+        if not rec.removed and rec._fmap then
+            for _, fobj in pairs(rec._fmap) do
+                if fobj.target_idx ~= nil then
+                    local tgt = rec._fmap[fobj.target_idx]
+                    if tgt then
+                        fobj.target = tgt
+                    end
+                end
+            end
+            rec._fmap = nil
         end
     end
 
@@ -1158,6 +1431,7 @@ function M.start_build(rooms_module, opts)
     }
 
     local co = coroutine.create(function()
+        reset_block_cache()
         local plan, variants = M.load_all()
         if not plan then
             return false, 'blueprints unavailable: ' .. tostring(variants)
@@ -1181,6 +1455,9 @@ function M.start_build(rooms_module, opts)
         builder.plan = plan
 
         local function attempt(relaxed)
+            -- fresh surface memo per attempt; the map BLOCK cache is
+            -- intentionally kept across attempts (blocks cannot change
+            -- during layout — digging happens later)
             local placer = Placer.new({
                 plan = plan,
                 variants = variants,
@@ -1193,7 +1470,9 @@ function M.start_build(rooms_module, opts)
             })
             placer.entrance = opts.entrance
             placer.max_tries = opts.max_tries or 8000
+            slice_begin()
             local ok, reason = placer:build()
+            slice_end()
             if not ok then return nil, reason end
             return placer
         end
@@ -1224,7 +1503,7 @@ function M.start_build(rooms_module, opts)
 
     builder.co = co
 
-    -- resume for up to `budget` yields (each yield ~ yield_every tries)
+    -- resume for up to `budget` yields (each yield ~ SLICE_MS of work)
     function builder:step(budget)
         budget = budget or 1
         for _ = 1, budget do
@@ -1253,9 +1532,27 @@ function M.start_build(rooms_module, opts)
         end
     end
 
+    -- r3.8: resume for up to `ms` milliseconds of wall-clock work.
+    -- This is the driver the game uses: the coroutine yields every
+    -- ~SLICE_MS, so each resume costs at most ~SLICE_MS and the loop
+    -- stops as soon as the budget is spent — the frame NEVER stalls
+    -- for long regardless of map size.
+    function builder:step_ms(ms)
+        ms = ms or 6
+        local t0 = now_ms()
+        while not self.done do
+            self:step(1)
+            if self.done then return end
+            if now_ms() - t0 >= ms then return end
+        end
+    end
+
     function builder:result()
-        if not self.done then
-            self:step(math.huge)
+        -- run synchronously to completion (tests / small maps): each
+        -- resume does at most ~SLICE_MS of work, the loop just keeps
+        -- going until the coroutine dies.
+        while not self.done do
+            self:step(1)
         end
         local r = self.res or { false, self.status }
         return table.unpack(r)

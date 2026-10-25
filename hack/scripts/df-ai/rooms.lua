@@ -489,7 +489,7 @@ function room:constructions_done()
     -- Fallback: scan buildings at our position
     local pos = self:pos()
     for _, bld in ipairs(df.global.world.buildings.all) do
-        if bld.z_level == pos.z and bld.centerx == pos.x and bld.centery == pos.y then
+        if bld.z == pos.z and bld.centerx == pos.x and bld.centery == pos.y then
             self.bld_id = bld.id
             return true
         end
