@@ -92,6 +92,8 @@ function Population.new(ai)
         squad_melee = nil,
         squad_ranged = nil,
         noble_rooms = {},
+        -- uids still waiting for a bedroom/dining spot (r3.9 citizen diff)
+        _pending_rooms = {},
     }
     setmetatable(o, Population)
     return o
@@ -177,6 +179,16 @@ function Population:update_citizenlist()
     local all = world.units.all
     if not all then return end
 
+    -- r3.9 (C++ update_citizenlist parity): DIFF the citizen set. Every
+    -- newly-seen citizen goes through plan:new_citizen (dining spot +
+    -- bedroom + jail cells), every vanished one through plan:del_citizen
+    -- (frees the rooms). This was dropped in the r3.4 port — migrants
+    -- NEVER got bedrooms and dead dwarves kept theirs forever. It is
+    -- also what produces the old build's post-load
+    -- "assign bedroom (owned by ...)" burst: the first scan after a
+    -- (re)load treats every citizen as new and re-issues the rooms.
+    local old = self.citizen or {}
+
     local new_citizens = {}
     local new_military = {}
     local new_pets = {}
@@ -186,10 +198,19 @@ function Population:update_citizenlist()
     for _, unit in ipairs(all) do
         if not dfhack.units.isAlive(unit) then
         elseif dfhack.units.isCitizen(unit, true) then
-            new_citizens[unit.id] = true
-            local squad_id = unit.military.squad_id
-            if squad_id >= 0 then
-                new_military[unit.id] = squad_id
+            -- C++ skips babies (they share the mother's room via the
+            -- DF bug 5551 workaround); children DO get their own rooms
+            local is_baby = false
+            pcall(function()
+                is_baby = dfhack.units.isBaby(unit)
+                    or unit.profession == df.profession.BABY
+            end)
+            if not is_baby then
+                new_citizens[unit.id] = true
+                local squad_id = unit.military.squad_id
+                if squad_id >= 0 then
+                    new_military[unit.id] = squad_id
+                end
             end
         elseif dfhack.units.isOwnGroup(unit) then
             new_pets[unit.id] = true
@@ -197,6 +218,52 @@ function Population:update_citizenlist()
             local r = unit.relationship_ids
             if r[df.unit_relationship_type.PetOwner] >= 0 then
                 new_pets[unit.id] = true
+            end
+        end
+    end
+
+    -- room bookkeeping BEFORE overwriting the sets (plan:del_citizen
+    -- needs to know who is gone)
+    local plan = self.ai and self.ai.plan
+    if plan then
+        for uid in pairs(old) do
+            if not new_citizens[uid] then
+                pcall(function() plan:del_citizen(uid) end)
+                self._pending_rooms[uid] = nil
+            end
+        end
+        for uid in pairs(new_citizens) do
+            if not old[uid] then
+                self._pending_rooms[uid] = true
+            end
+        end
+        -- (re)assign rooms for every citizen that still needs them.
+        -- Retried each scan because the blueprint rooms may not exist
+        -- yet on the very first scan after embark (plan setup still
+        -- running). plan:new_citizen is idempotent: getbedroom returns
+        -- early for an already-owned room, getdiningroom skips units
+        -- that already have a table/chair/farm rights.
+        local pending = self._pending_rooms
+        for uid in pairs(pending) do
+            if not new_citizens[uid] then
+                pending[uid] = nil -- gone; nothing to assign anymore
+            else
+                local ok_a, got = pcall(function()
+                    plan:new_citizen(uid)
+                    -- consider it done once the dwarf owns a bedroom
+                    for _, r in ipairs(plan.room_category['bedroom'] or {}) do
+                        if r.owner == uid then return true end
+                    end
+                    return false
+                end)
+                if ok_a and got then
+                    pending[uid] = nil
+                elseif not ok_a then
+                    dfhack.printerr('[df-ai:population] room assignment '
+                        .. 'failed for unit ' .. tostring(uid) .. ': '
+                        .. tostring(got))
+                    pending[uid] = nil -- do not spam errors every scan
+                end
             end
         end
     end
@@ -1680,12 +1747,43 @@ function Population:perform_trade()
 end
 
 -- ============================================================
--- Jobs (remove trader flags from forbidden items)
+-- Jobs
 -- ============================================================
 
+-- r3.9 anti-idle (C++ Population::update_jobs parity): FORCE-unsuspend
+-- every suspended non-repeat job. This was ported as a no-op stub in
+-- r3.6 ("nothing to watch here anymore") — that was wrong. A suspended
+-- job (a building task whose dwarf got interrupted, a construction
+-- cancelled once by a stray item...) never resumes by itself, its dwarf
+-- stands idle, and at any given time a busy fort has several of them.
+-- The old C++ build swept them every pop update; that is precisely why
+-- it "never left dwarves idle". Repeat jobs ( workshops on repeat) are
+-- skipped so the player's intentional repeat loops stay untouched.
 function Population:update_jobs()
-    -- v50 removed the CollectWeapons/CollectArmor jobs (military hauling was
-    -- reworked into squad equipment storage); nothing to watch here anymore.
+    local world = df.global.world
+    if not world or not world.jobs then return end
+    local unsuspended = 0
+    for _, job in ipairs(world.jobs.list) do
+        local ok, unsusp = pcall(function()
+            -- NOTE: 'repeat' is a Lua keyword — index it as a string!
+            if job and job.flags and job.flags.bits.suspend
+                and not job.flags.bits['repeat'] then
+                job.flags.bits.suspend = false
+                return true
+            end
+            return false
+        end)
+        if ok and unsusp then
+            unsuspended = unsuspended + 1
+        end
+    end
+    if unsuspended > 0 then
+        -- visible but throttled: these are exactly the "why was my dwarf
+        -- standing there" moments
+        self._unsuspend_total = (self._unsuspend_total or 0) + unsuspended
+        dfhack.println(('[df-ai] unsuspended %d stalled job(s) (%d total this session)')
+            :format(unsuspended, self._unsuspend_total))
+    end
 end
 
 -- ============================================================

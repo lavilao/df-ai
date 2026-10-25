@@ -322,3 +322,77 @@ Workshops construct without material selection (C++ picks blocks→boulder→woo
 
 - Big-map regression: 96×96×16 rock world, 8000 placement tries → **3.31 s CPU** for 759 rooms/380 blueprints (r3.7 took minutes); builder is a resumable coroutine stepped with a time budget.
 - Tick cadences = C++ originals (the user's 240→1000 restart-cadence commit preserved).
+
+## r3.9 — old-build QOL parity (from the user's C++-era df-ai.log)
+
+The user supplied a real log from the C++ 0.47 build and asked: "Analiza y
+determina que nos falta y agregalo" (world-unload self-disable, no idle
+dwarves, etc.). Pattern analysis of the log + C++ source diff gave six gaps,
+all closed:
+
+### Gaps found (log evidence → C++ source → fix)
+
+1. **`world unloaded, disabling self`** (3x in log; ai.cpp SC_WORLD_UNLOADED)
+   → df-ai.lua now handles SC_WORLD_UNLOADED: full teardown, `the_ai = nil`,
+   and with `random_embark` on it creates a FRESH AI instance (old build
+   immediately did `choosing "Continue Game"` afterwards); with random_embark
+   off it genuinely self-disables. Prevents cross-world ghost state.
+2. **Force-unsuspend of stalled jobs** (C++ `Population::update_jobs`)
+   → our r3.6 port made this a no-op stub ("nothing to watch anymore") —
+   wrong. Ported verbatim: every suspended non-repeat job in
+   `world.jobs.list` gets `flags.bits.suspend = false` at the pop cadence.
+   Suspended jobs never self-resume; their dwarves idle forever. This is
+   THE anti-idle mechanism the user asked for ("no dejar enanos en idle").
+   Repeat jobs are skipped so player repeat-loops stay intact. Logged:
+   `[df-ai] unsuspended N stalled job(s) (M total this session)`.
+3. **Migrant room assignment** (21x `assign bedroom (owned by X, Peasant)`
+   in log; C++ `Population::update_citizenlist` diff → `plan.new_citizen`)
+   → our port rebuilt the citizen set WITHOUT diffing: `Plan:new_citizen`
+   and `Plan:del_citizen` existed since r3.8 but were NEVER CALLED —
+   migrants never got bedrooms, dead dwarves kept theirs. Ported the C++
+   diff logic (babies skipped via `dfhack.units.isBaby`), with a
+   `_pending_rooms` retry that survives plan-setup lag; idempotent
+   (getbedroom tier-1 early-returns, getdiningroom checks existing users).
+   Old-format logs restored: `assign bedroom (owned by <readable name>,
+   <profession>)` via new `Plan:describe_unit`.
+4. **Pause announcement handling** (167x `pause: Digging designation
+   cancelled: damp stone located. xN` in log; C++ `handle_pause_event`)
+   → watch_announcements now: logs every PAUSE/DO_MEGA report C++-style
+   (`pause: <text> xN`), unpauses IMMEDIATELY on DIG_CANCEL_DAMP/WARM so
+   the plan loop re-designates the same tick (plan re-issue existed since
+   r3.7), tag_enemies on MEGABEAST/UNDEAD/danger, unpause on DO_MEGA.
+   CRITICAL ENABLER: the announcement watcher moved from a 10-TICK
+   repeat-util timer to a self-re-arming 15-FRAME timer — ticks freeze
+   while paused, so the tick-based watcher could never see the pause
+   cause it was supposed to react to. The d_init announcement flags
+   (PAUSE/DO_MEGA bits) drive the classification, fully pcall-guarded.
+5. **`pause without an event` + `[ERROR] paused in unknown viewscreen X`**
+   (10x + 10x in log; pause.cpp SC_PAUSED/SC_VIEWSCREEN_CHANGED) → the
+   unpause watchdog logs the former once per pause episode; the raw
+   state-change hook logs the latter once per unique focus string
+   (`note_unknown_viewscreen` via `dfhack.gui.getFocusString`).
+6. **`disabling minimap.`** (embark setup) → startup pcall-disables the
+   minimap plugin when active (config `disable_minimap`, default true).
+
+### Also
+
+- `arm_embark_watch` gained a single-chain guard (`EMBARK_WATCH_RUNNING`
+  env global): with the world-unload teardown, shutdown() now runs twice
+  per leave-fortress (SC_MAP_UNLOADED *and* SC_WORLD_UNLOADED) and used
+  to stack duplicate poll chains.
+- NOT ported (evaluated, deliberately skipped): `fixup_open` construction
+  fix-ups (our shape-based is_dug already sidesteps the stall; only 4
+  occurrences in 3 months), `make_map_walkable`, diplomat textviewer
+  dismissal (v50 screens differ), direct-at-workshop furniture queueing
+  (manager orders cover it), `updating world, goal:` sim (v50 flow
+  differs).
+
+### Verification
+
+- unit_fixes.lua section 9: 23 new checks — force-unsuspend semantics
+  (repeat jobs untouched), citizen diff (new/vanished/baby/pending-retry),
+  pause logging `x12` format, DIG_CANCEL same-pass unpause, DO_MEGA
+  megabeast unpause + tag_enemies, unknown-viewscreen once-per-name,
+  world-unload teardown both variants (self-disable vs fresh instance).
+- Full suite green: unit_fixes + ci_smoke + blueprint engine + big-map
+  perf (3.31 s CPU unchanged).

@@ -83,6 +83,8 @@ local function default_config()
         manage_nobles = true,
         cancel_announce = 0,
         allow_pause = true,
+        -- r3.9 (C++ parity): turn the minimap overlay off at startup
+        disable_minimap = true,
     }
 end
 
@@ -158,6 +160,30 @@ function AI:on_state_change(sc)
         self:startup()
     elseif sc == SC_MAP_UNLOADED then
         self:shutdown()
+    elseif sc == SC_WORLD_UNLOADED then
+        -- C++ parity (ai.cpp): "world unloaded, disabling self". The old
+        -- build tore ALL state down the moment the save went away —
+        -- without this, Lua globals from the previous world (population
+        -- caches, plan rooms, last_report_id) leak into the next world
+        -- and the AI acts on ghosts. If the plugin stays enabled we
+        -- either re-arm the auto-embark watcher (random_embark: the old
+        -- log shows it immediately "choosing \"Continue Game\"" after a
+        -- world unload) or genuinely disable ourselves when there is
+        -- nothing for us to do at the menus.
+        debug_log('world unloaded, disabling self')
+        self:shutdown()
+        self:clear()
+        the_ai = nil
+        if ai_enabled and self.config and self.config.random_embark then
+            -- fresh instance for the next world, embark watcher re-armed
+            -- by shutdown() above
+            the_ai = AI:new()
+            the_ai:init()
+        elseif ai_enabled then
+            ai_enabled = false
+            debug_log('df-ai disabled (random_embark off — nothing to do '
+                .. 'without a world)')
+        end
     end
 end
 
@@ -237,6 +263,20 @@ function AI:startup()
     safe(function() self:register_repeating_tasks() end, 'repeating tasks')
     safe(function() self:unpause() end, 'unpause')
     safe(function() self:dismiss_popups() end, 'popup dismiss')
+    -- C++ parity (embark setup): the old build disabled the minimap
+    -- overlay right after embark ("disabling minimap."). The overlay
+    -- redraws every frame and it steals the corner of the screen the
+    -- AI logs into.
+    if self.config.disable_minimap ~= false then
+        safe(function()
+            local ok_on, on = pcall(function()
+                return dfhack.plugins.isEnabled('minimap') end)
+            if ok_on and on then
+                dfhack.run_command('disable minimap')
+                debug_log('disabling minimap.')
+            end
+        end, 'disable minimap')
+    end
     debug_log('fortress automation armed: ' .. self:heartbeat_line())
 end
 
@@ -263,9 +303,18 @@ end
 -- NOTE: repeat-util 'ticks' timers do NOT run without a loaded map, so
 -- this uses a self-re-arming frame-based dfhack.timeout instead (frames
 -- render at the title screen and during worldgen).
+-- r3.9: SINGLE chain guard. Since the world-unload teardown, shutdown()
+-- runs twice per leave-fortress (SC_MAP_UNLOADED *and*
+-- SC_WORLD_UNLOADED); without the guard each call stacks ANOTHER poll
+-- chain and the embark flow gets driven twice per frame.
+-- EMBARK_WATCH_RUNNING is an env global: it must survive script
+-- re-execution exactly like ai_enabled/the_ai.
 function AI:arm_embark_watch()
+    if EMBARK_WATCH_RUNNING then return end
+    EMBARK_WATCH_RUNNING = true
     local function poll()
         if not ai_enabled or dfhack.isMapLoaded() then
+            EMBARK_WATCH_RUNNING = false
             return -- stop polling; the map-load flow takes over
         end
         local ok, err = pcall(function()
@@ -372,11 +421,14 @@ function AI:register_repeating_tasks()
             if self.camera then safe(function() self.camera:update() end, 'camera update') end
         end)
     end
-    -- C++ ai.cpp: announcements every tick (cheap report-vector tail
-    -- check; 10 is fine in Lua and skips worldgen noise)
-    repeatutil.scheduleEvery(GLOBAL_KEY .. '-announce', 10, 'ticks', function()
-        safe(function() self:watch_announcements() end, 'announcements')
-    end)
+    -- r3.9: announcements on FRAMES, not ticks. The old C++ build ran
+    -- the announcement watcher every native tick AND handled pauses via
+    -- onstatechange(SC_PAUSED) — but tick timers freeze while the fort
+    -- is paused, so a tick-based watcher can NEVER see "Digging
+    -- designation cancelled" (the pause cause) until after the game is
+    -- unpaused again. Frame timers keep firing while paused, which is
+    -- exactly what the dig-cancel/unpause loop needs.
+    self:arm_announce_watch()
     -- Daily heartbeat: one status line per game day (1200 ticks) so the
     -- console always shows what the automation is doing
     repeatutil.scheduleEvery(GLOBAL_KEY .. '-heartbeat', 1200, 'ticks', function()
@@ -416,6 +468,27 @@ function AI:unpause()
     return false
 end
 
+-- r3.9: announcement watcher on a self-re-arming FRAME timer. Runs
+-- while the fort is paused (frames keep rendering; ticks do not), which
+-- is what makes the C++ pause parity actually work: "pause: Digging
+-- designation cancelled: damp stone located. x12" is logged and the
+-- game unpauses within ~0.25s instead of stalling on the watchdog's
+-- 5-second timeout. The last_report_id watermark keeps each pass O(new
+-- reports), so 4 passes/second cost nothing.
+function AI:arm_announce_watch()
+    if self.announce_watch_armed then return end
+    self.announce_watch_armed = true
+    local function poll()
+        if not ai_enabled or not dfhack.isMapLoaded() then
+            self.announce_watch_armed = false
+            return
+        end
+        safe(function() self:watch_announcements() end, 'announcements')
+        dfhack.timeout(15, 'frames', poll) -- ~0.25s at 60 fps
+    end
+    dfhack.timeout(10, 'frames', poll)
+end
+
 -- C++ parity (ai.cpp): while the fort is PAUSED the AI's repeating 'tick'
 -- timers never fire — one pause event (strike announcement, season
 -- popup, combat) after startup froze the whole game forever. The C++
@@ -433,6 +506,14 @@ function AI:arm_unpause_watch()
         end
         local ok, paused = pcall(function() return df.global.pause_state end)
         if ok and paused then
+            -- C++ parity (pause.cpp): "pause without an event" — the game
+            -- paused without a PAUSE-flagged announcement backing it.
+            -- Logged ONCE per pause episode, not every 0.5s.
+            if not self.saw_pause_announcement and not self._pause_episode_logged then
+                self._pause_episode_logged = true
+                debug_log('pause without an event')
+            end
+            self.saw_pause_announcement = false
             self.paused_frames = (self.paused_frames or 0) + 30 -- ~0.5s at 60fps
             -- after ~5 seconds stuck paused, force unpause + dismiss popups
             if self.paused_frames >= 300 then
@@ -443,6 +524,7 @@ function AI:arm_unpause_watch()
             end
         else
             self.paused_frames = 0
+            self._pause_episode_logged = false
         end
         dfhack.timeout(30, 'frames', poll)
     end
@@ -556,6 +638,37 @@ function AI:is_danger_announcement(ann)
     return ok and self.danger_announcements[tonumber(t)] == true
 end
 
+-- C++ parity (pause.cpp handle_pause_event): types that trigger an
+-- immediate re-dig / enemy response. Sub-tables are created BEFORE the
+-- pcall: a mock/partial df.announcement_type must degrade to "no known
+-- types", not to a crash in the watcher.
+local PAUSE_TYPES = nil
+local function pause_type_ids()
+    if PAUSE_TYPES then return PAUSE_TYPES end
+    PAUSE_TYPES = { dig_cancel = {}, enemy = {} }
+    pcall(function()
+        local T = df.announcement_type
+        PAUSE_TYPES.dig_cancel[T.DIG_CANCEL_DAMP] = true
+        PAUSE_TYPES.dig_cancel[T.DIG_CANCEL_WARM] = true
+        for _, name in ipairs({ 'MEGABEAST_ARRIVAL', 'UNDEAD_ATTACK' }) do
+            if T[name] then PAUSE_TYPES.enemy[T[name]] = true end
+        end
+    end)
+    return PAUSE_TYPES
+end
+
+-- d_init announcement flags for a report type: { pause = bool,
+-- do_mega = bool }. pcall-guarded: d_init layout drift must never kill
+-- the announcement watcher.
+function AI:announce_flags(atype)
+    local ok, f = pcall(function()
+        local flags = df.global.d_init.announcements.flags[atype]
+        return { pause = flags.bits.PAUSE, do_mega = flags.bits.DO_MEGA }
+    end)
+    if ok and f then return f end
+    return { pause = false, do_mega = false }
+end
+
 function AI:watch_announcements()
     local world = df.global.world
     if not world or not world.status then return end
@@ -571,6 +684,8 @@ function AI:watch_announcements()
 
     local danger = false
     local newest = self.last_report_id
+    local unpause_needed = false
+    local types = pause_type_ids()
     -- DFHack vectors are 0-BASED: valid indices are 0..#announcements-1
     -- (the old loop started at #announcements, which is nil, and broke out
     -- immediately without ever examining a report)
@@ -580,15 +695,74 @@ function AI:watch_announcements()
         if not ok or not aid then break end
         if aid <= self.last_report_id then break end
         if aid > newest then newest = aid end
-        if self:is_danger_announcement(ann) then
-            danger = true
-            local okn, name = pcall(function() return tostring(ann.type) end)
-            debug_log('danger report: ' .. (okn and name or 'unknown'))
+
+        local ok_t, atype = pcall(function() return tonumber(ann.type) end)
+        if ok_t then
+            -- C++ handle_pause_event: log every pause-causing report the
+            -- way the game presented it ("pause: Digging designation
+            -- cancelled: damp stone located. x12")
+            local flags = self:announce_flags(atype)
+            if flags.pause or flags.do_mega then
+                local ok_x, rep = pcall(function()
+                    return ann.repeat_count end)
+                local text = ''
+                pcall(function() text = tostring(ann.text) end)
+                local suffix = (ok_x and rep and rep > 0)
+                    and (' x' .. tostring(rep + 1)) or ''
+                debug_log('pause: ' .. text .. suffix)
+                self.saw_pause_announcement = true
+            end
+            -- damp/warm stone cancelled a dig designation: unpause
+            -- IMMEDIATELY so the plan loop re-designates it this tick
+            -- (the C++ built does not sit paused for 5s on every wet
+            -- vein — 167 of these in a 3-month fort!)
+            if types.dig_cancel[atype] then
+                unpause_needed = true
+            elseif types.enemy[atype] or self:is_danger_announcement(ann) then
+                danger = true
+                local okn, name = pcall(function()
+                    return tostring(df.announcement_type[atype]) end)
+                debug_log('danger report: ' .. (okn and name or 'unknown'))
+            end
+            if flags.do_mega then
+                unpause_needed = true
+            end
         end
     end
     self.last_report_id = newest
     if danger then
         safe(function() self:tag_enemies() end, 'tag_enemies')
+    end
+    if unpause_needed then
+        safe(function() self:unpause() end, 'dig-cancel unpause')
+    end
+end
+
+-- C++ parity (pause.cpp statechanged SC_VIEWSCREEN_CHANGED): while the
+-- game is paused on a non-dwarfmode screen, log WHICH screen blocks us —
+-- once per unique screen name, exactly like the old build's
+-- "[ERROR] paused in unknown viewscreen viewscreen_civlistst".
+function AI:note_unknown_viewscreen(view)
+    if not self.seen_unknown_viewscreens then
+        self.seen_unknown_viewscreens = {}
+    end
+    local name = nil
+    pcall(function()
+        -- DFHack screens have a focus string ("lua/launcher", ...);
+        -- native screens report their C++ class name
+        name = dfhack.gui.getFocusString(view)
+    end)
+    if not name or name == '' then
+        pcall(function()
+            local t = tostring(view._type or '')
+            name = t:match('([%w_]+)>$') or t
+        end)
+    end
+    if not name or name == '' then return end
+    if name:find('^dwarfmode') then return end
+    if not self.seen_unknown_viewscreens[name] then
+        self.seen_unknown_viewscreens[name] = true
+        dfhack.printerr('[df-ai] paused in unknown viewscreen ' .. name)
     end
 end
 
@@ -701,6 +875,7 @@ end
 -- keep prior values if this env already ran the script before
 the_ai = the_ai or nil
 ai_enabled = ai_enabled or false
+EMBARK_WATCH_RUNNING = EMBARK_WATCH_RUNNING or false
 
 -- Modern DFHack enable API: lets `enable`/`disable`, the control
 -- panel and `script-manager` track our state.
@@ -821,6 +996,27 @@ dfhack.onStateChange[GLOBAL_KEY] = function(sc)
                     the_ai.embark:on_viewscreen()
                 end
             end, 'embark watcher')
+        end
+        -- pause visibility: the old C++ build logged every unknown
+        -- viewscreen the game got stuck on (once per name). Cheap and
+        -- it tells the user exactly what is blocking the AI.
+        safe(function()
+            local ok_p, paused = pcall(function()
+                return df.global.pause_state end)
+            if ok_p and paused and the_ai and the_ai.is_dwarfmode_viewscreen
+                and not the_ai:is_dwarfmode_viewscreen() then
+                local ok_v, view = pcall(function()
+                    return dfhack.gui.getCurViewscreen(true) end)
+                if ok_v and view then
+                    the_ai:note_unknown_viewscreen(view)
+                end
+            end
+        end, 'viewscreen watcher')
+    elseif sc == SC_WORLD_UNLOADED then
+        -- C++ parity: "world unloaded, disabling self" (ai.cpp). All
+        -- module state is dead the moment the save goes away.
+        if the_ai then
+            safe(function() the_ai:on_state_change(sc) end, 'world unload')
         end
     end
 end

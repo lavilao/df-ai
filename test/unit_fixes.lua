@@ -1130,6 +1130,229 @@ do
     end
 end
 
+-- ============================================================
+-- 9. r3.9 QOL (old-build log parity): world-unload teardown,
+--    force-unsuspend, citizen-diff room assignment, pause
+--    announcements, unknown viewscreen logging
+-- ============================================================
+print('--- r3.9 QOL: old-build parity ---')
+do
+    -- additive mock extensions for the r3.9 paths
+    df_mock.announcement_type.DIG_CANCEL_DAMP = 6
+    df_mock.announcement_type.MEGABEAST_ARRIVAL = 7
+    df_mock.unit_relationship_type = { PetOwner = 0 }
+    dfhack_mock.units.isOwnGroup = function(u) return u.own_group == true end
+    dfhack_mock.units.isBaby = function(u) return u.baby == true end
+    dfhack_mock.gui.getFocusString = function(v) return v.__focus end
+
+    -- real DFHack injects these as globals; distinct strings so the
+    -- on_state_change branches are mutually exclusive in the mock
+    _G.SC_MAP_LOADED = 'map_loaded'
+    _G.SC_MAP_UNLOADED = 'map_unloaded'
+    _G.SC_WORLD_UNLOADED = 'world_unloaded'
+    _G.SC_VIEWSCREEN_CHANGED = 'viewscreen_changed'
+
+    local ok_ai2, AI2 = pcall(dfhack_mock.run_script_with_env, nil, 'df-ai', { module = true })
+    check(ok_ai2, 'df-ai main module loads (r3.9)')
+    local ai2 = AI2:new()
+    ai2:init()
+
+    -- --------------------------------------------------------
+    -- 9a. force-unsuspend (C++ Population::update_jobs)
+    -- --------------------------------------------------------
+    local ok_pop2, Population2 = pcall(dfhack_mock.run_script_with_env,
+        nil, 'df-ai/population', { module = true })
+    check(ok_pop2, 'population module loads (r3.9)')
+    local pop2 = Population2.new({ config = {} })
+
+    local stalled = { flags = { bits = { suspend = true, ['repeat'] = false } } }
+    local repeat_job = { flags = { bits = { suspend = true, ['repeat'] = true } } }
+    local running = { flags = { bits = { suspend = false, ['repeat'] = false } } }
+    df_mock.global.world = {
+        jobs = { list = dfvec({ stalled, repeat_job, running }) },
+    }
+    local printed_u = {}
+    local old_pl_u = dfhack_mock.println
+    dfhack_mock.println = function(msg) printed_u[#printed_u + 1] = tostring(msg) end
+    pop2:update_jobs()
+    dfhack_mock.println = old_pl_u
+    check(stalled.flags.bits.suspend == false,
+        'suspended non-repeat job gets force-unsuspended (anti-idle)')
+    check(repeat_job.flags.bits.suspend == true,
+        'repeat job stays suspended (player repeat loops untouched)')
+    check(running.flags.bits.suspend == false,
+        'running job untouched')
+    local saw_unsuspend_log = false
+    for _, m in ipairs(printed_u) do
+        if m:find('unsuspended 1 stalled job', 1, true) then saw_unsuspend_log = true end
+    end
+    check(saw_unsuspend_log, 'unsuspend is visible in the log (1 job this pass)')
+
+    -- --------------------------------------------------------
+    -- 9b. citizen diff -> plan:new_citizen / plan:del_citizen
+    -- --------------------------------------------------------
+    local newc, delc = {}, {}
+    local bedroom_stub = {}
+    pop2.ai = { config = {}, plan = {
+        new_citizen = function(_, uid) newc[#newc + 1] = uid end,
+        del_citizen = function(_, uid) delc[#delc + 1] = uid end,
+        room_category = { bedroom = bedroom_stub },
+    } }
+    -- migrant wave: 101 already there, 102/103 arrive; baby 104 skipped
+    local function mkunit(id)
+        return { id = id, citizen = true, alive = true, military = { squad_id = -1 } }
+    end
+    df_mock.global.world = {
+        units = { all = dfvec({
+            mkunit(101), mkunit(102), mkunit(103),
+            { id = 104, citizen = true, alive = true, baby = true,
+              military = { squad_id = -1 } },
+        }) },
+    }
+    pop2:update_citizenlist()
+    check(#newc == 3 and newc[1] == 101 and newc[2] == 102 and newc[3] == 103,
+        'first scan treats every non-baby citizen as new (post-load assign burst)')
+    check(pop2._pending_rooms[101] and pop2._pending_rooms[102]
+        and pop2._pending_rooms[103] and not pop2._pending_rooms[104],
+        'babies never get rooms queued (C++ isBaby skip)')
+    check(pop2.citizen[104] == nil, 'baby is not in the citizen set')
+
+    -- retirement/death: 103 vanishes -> del_citizen + pending cleared
+    df_mock.global.world = {
+        units = { all = dfvec({ mkunit(101), mkunit(102) }) },
+    }
+    pop2:update_citizenlist()
+    check(#delc == 1 and delc[1] == 103,
+        'vanished citizen goes through plan:del_citizen')
+    check(pop2._pending_rooms[103] == nil,
+        'del_citizen clears the pending-room entry')
+
+    -- pending retry: once plan owns the room, pending drains and
+    -- new_citizen is NOT called again (idempotent drain)
+    local nc2, dc2 = {}, {}
+    pop2.ai = { config = {}, plan = {
+        new_citizen = function(_, uid) nc2[#nc2 + 1] = uid end,
+        del_citizen = function(_, uid) dc2[#dc2 + 1] = uid end,
+        room_category = { bedroom = { { owner = 102 } } },
+    } }
+    df_mock.global.world = {
+        units = { all = dfvec({ mkunit(101), mkunit(102) }) },
+    }
+    pop2:update_citizenlist()
+    check(pop2._pending_rooms[102] == nil,
+        'citizen whose bedroom got owned is drained from pending')
+    check(pop2._pending_rooms[101] == true,
+        'citizen without a bedroom stays pending for the next scan')
+
+    -- --------------------------------------------------------
+    -- 9c. pause announcements + dig-cancel unpause
+    -- --------------------------------------------------------
+    local ai3 = AI2:new()
+    ai3:init()
+    -- d_init announcement flags: everything PAUSEs; MEGABEAST_ARRIVAL (7)
+    -- is also DO_MEGA (like the real d_init.txt defaults)
+    df_mock.global.d_init = { announcements = {
+        flags = setmetatable({}, {
+            __index = function(_, t)
+                return { bits = { PAUSE = true, DO_MEGA = (t == 7) } }
+            end,
+        }),
+    } }
+    df_mock.global.pause_state = true
+    local tagged3 = 0
+    ai3.tag_enemies = function() tagged3 = tagged3 + 1 end
+    local printed_p = {}
+    local old_pl_p = dfhack_mock.println
+    -- debug_log passes label + text as SEPARATE println args — concat all
+    dfhack_mock.println = function(...)
+        local parts = {}
+        for _, v in ipairs({ ... }) do parts[#parts + 1] = tostring(v) end
+        printed_p[#printed_p + 1] = table.concat(parts)
+    end
+
+    -- fresh AI: last_report_id initializes to next_report_id - 1 = 20, so
+    -- a new report must carry id >= next_report_id (game invariant:
+    -- reports get id == next_report_id when they are appended)
+    df_mock.global.world = {
+        status = {
+            announcements = dfvec({
+                { id = 21, type = 6, text = 'Digging designation cancelled: damp stone located.',
+                  repeat_count = 11 },
+            }),
+            next_report_id = 21,
+        },
+    }
+    ai3:watch_announcements()
+    dfhack_mock.println = old_pl_p
+    local saw_pause_line = false
+    for _, m in ipairs(printed_p) do
+        if m:find('pause: Digging designation cancelled: damp stone located. x12', 1, true) then
+            saw_pause_line = true
+        end
+    end
+    check(saw_pause_line, 'pause announcement logged C++-style with repeat count xN')
+    check(df_mock.global.pause_state == false,
+        'DIG_CANCEL_DAMP immediately unpauses (plan re-digs this tick)')
+    check(tagged3 == 0, 'dig-cancel does not trigger tag_enemies')
+
+    -- megabeast: tag_enemies fires, still unpauses (DO_MEGA path)
+    df_mock.global.pause_state = true
+    df_mock.global.world = {
+        status = {
+            announcements = dfvec({
+                { id = 21, type = 6, text = 'Digging designation cancelled: damp stone located.',
+                  repeat_count = 11 },
+                { id = 22, type = 7, text = 'A fearsome creature!',
+                  repeat_count = 0 },
+            }),
+            next_report_id = 22,
+        },
+    }
+    ai3:watch_announcements()
+    check(tagged3 == 1, 'MEGABEAST_ARRIVAL triggers tag_enemies')
+    check(df_mock.global.pause_state == false,
+        'MEGABEAST (DO_MEGA) announcements end unpaused')
+
+    -- --------------------------------------------------------
+    -- 9d. unknown viewscreen logging (once per name)
+    -- --------------------------------------------------------
+    local err_seen2 = {}
+    local old_pe2 = dfhack_mock.printerr
+    dfhack_mock.printerr = function(msg) err_seen2[#err_seen2 + 1] = tostring(msg) end
+    ai3:note_unknown_viewscreen({ __focus = 'viewscreen_civlistst' })
+    ai3:note_unknown_viewscreen({ __focus = 'viewscreen_civlistst' })
+    ai3:note_unknown_viewscreen({ __focus = 'viewscreen_optionst' })
+    dfhack_mock.printerr = old_pe2
+    local civ_errs, opt_errs = 0, 0
+    for _, m in ipairs(err_seen2) do
+        if m:find('paused in unknown viewscreen viewscreen_civlistst', 1, true) then civ_errs = civ_errs + 1 end
+        if m:find('paused in unknown viewscreen viewscreen_optionst', 1, true) then opt_errs = opt_errs + 1 end
+    end
+    check(civ_errs == 1, 'unknown viewscreen logged ONCE per name')
+    check(opt_errs == 1, 'each distinct viewscreen gets its own single log')
+
+    -- --------------------------------------------------------
+    -- 9e. world unloaded -> teardown + self-disable / re-arm
+    -- --------------------------------------------------------
+    _G.ai_enabled = true
+    _G.the_ai = ai2
+    ai2.config.random_embark = false
+    ai2:on_state_change(_G.SC_WORLD_UNLOADED)
+    check(_G.the_ai == nil and _G.ai_enabled == false,
+        'world unload with random_embark OFF: AI torn down AND self-disabled')
+
+    _G.ai_enabled = true
+    _G.the_ai = ai3
+    ai3.config.random_embark = true
+    ai3:on_state_change(_G.SC_WORLD_UNLOADED)
+    check(_G.the_ai ~= nil and _G.the_ai ~= ai3,
+        'world unload with random_embark ON: fresh AI instance (old-build "Continue Game" parity)')
+    check(_G.ai_enabled == true,
+        'plugin stays enabled for the auto-embark flow')
+    _G.ai_enabled = false
+    _G.the_ai = nil
+end
+
 print(failures == 0 and '=== ALL UNIT TESTS PASS ==='
     or ('=== ' .. failures .. ' FAILURES ==='))
 os.exit(failures == 0 and 0 or 1)

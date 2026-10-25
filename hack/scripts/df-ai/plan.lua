@@ -2556,6 +2556,29 @@ end
 
 -- C++ Plan::set_owner — assign/release a room's owner (v50: zone
 -- assigned_unit_id via dfhack.buildings.setOwner)
+-- r3.9: "Kadol Nanirzefon, Peasant" for the assign logs (old-build log
+-- parity). Best effort: falls back to the raw unit id.
+function Plan:describe_unit(uid)
+    local u = df.unit.find(uid)
+    if not u then return 'unit ' .. tostring(uid) end
+    local name = nil
+    pcall(function()
+        name = dfhack.units.getReadableName(u)
+    end)
+    if not name or name == '' then
+        pcall(function()
+            name = dfhack.units.getRaceNameById(u.race)
+        end)
+    end
+    name = (name and name ~= '') and name or ('unit ' .. tostring(uid))
+    local prof = ''
+    pcall(function()
+        local cap = dfhack.units.getProfessionName(u)
+        if cap and cap ~= '' then prof = ', ' .. cap end
+    end)
+    return name .. prof
+end
+
 function Plan:set_owner(r, uid)
     r.owner = uid
     local zb = self:_ensure_room_zone(r)
@@ -2579,7 +2602,8 @@ function Plan:getbedroom(unit_id)
     for _, r in ipairs(rooms) do
         if r.owner < 0 and r.status ~= 'plan' then
             self:set_owner(r, unit_id)
-            self:_log('assigned bedroom to unit ' .. unit_id)
+            -- old-build log parity: "assign bedroom (owned by X, Y)"
+            self:_log('assign bedroom (owned by ' .. self:describe_unit(unit_id) .. ')')
             if r.status == 'finished' then self:furnish_room(r) end
             return r
         end
@@ -2588,7 +2612,8 @@ function Plan:getbedroom(unit_id)
         if r.owner < 0 and r.status == 'plan' and not r.queue_dig then
             self:wantdig(r, -1)
             self:set_owner(r, unit_id)
-            self:_log('digging new bedroom for unit ' .. unit_id)
+            self:_log('assign bedroom (owned by ' .. self:describe_unit(unit_id)
+                .. ') (plan)')
             return r
         end
     end
