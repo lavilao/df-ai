@@ -396,3 +396,81 @@ all closed:
   world-unload teardown both variants (self-disable vs fresh instance).
 - Full suite green: unit_fixes + ci_smoke + blueprint engine + big-map
   perf (3.31 s CPU unchanged).
+
+---
+
+## Session 13 — r3.10: the C++ feature-parity audit + the big missing wave
+
+**User question:** "nos falta algo para tener feature parity con la version c++?"
+
+### The audit
+
+4 parallel deep-dives compared every C++ subsystem (develop branch, ~1 MB / 51
+.cpp files) against the Lua port. Scorecard before this session:
+
+- AT PARITY (or better): blueprint engine + 67 priority rules, room dig/build/
+  furnish pipeline, manager orders, military draft/dismiss/uniforms/training
+  trigger, nobles, pets/pastures, farms, labor management, world-unload
+  teardown (r3.9), levers/cistern monitor.
+- MISSING (implemented this session): plan persistence, threat-response
+  wiring, faithful stock counting, drink chain, kitchen bans, ghosts/slabs,
+  noble room value + engraving, archery directions, real camera priorities,
+  real enable/disable commands, report.log, validate.
+- STILL MISSING (deliberate): full trade UI automation (v50 trade screens are
+  unmapped in df-structures — the C++ keyfeed approach has no target),
+  weblegends (plugin does not exist in DFHack 53.16), lockstep (C-only memory
+  patching), auto-conviction via justice screens, occupations struct writes
+  (risky), cistern deep-channelling sequence.
+
+### Implemented (r3.10)
+
+1. **Plan persistence** (`df-ai/persist.lua`, NEW ~430 lines + plan.lua +
+   df-ai.lua wiring) — C++ plan_persist.cpp parity. Whole plan (rooms,
+   furniture, tasks, accesspath chains, lever targets, fort entrance,
+   priority latches, military thresholds) serializes to the world save via
+   `dfhack.persistent.saveWorldData('df-ai-plan', ...)` on map-unload,
+   world-unload, the save/abandon option screen, and while
+   `plotinfo.main.autosave_request` is set. `Plan:startup` restores it
+   instead of re-planning — no more duplicate bedrooms/traps after
+   save+reload. Site-id discriminator rejects stale data from a previous
+   embark. Round-trip unit-tested with cross-reference identity checks.
+2. **Threat response** — `AI:tag_enemies` now actually drives the (previously
+   caller-less) kill-order engine: megabeast/semimega/feature beast/titan/
+   demon/night creature -> all squads; undead/invader/marauder/underworld/
+   uninvited visitor -> one squad (least busy, C++ scoring); stale kill
+   orders cancelled when targets leave. 1200-tick cadence (C++ military.cpp).
+3. **Stocks fidelity** — `is_item_free` ported (trader/construction/encased/
+   forbid/dump/in_chest; non-hauling jobs; worn items; containers only when
+   EMPTY) + `stack_size` counting (drinks/ammo/meals were under-counted
+   5-25x). Drink chain: brews counted (amount/5), gated on free
+   barrels/pots (queues large pots when none — a container-less fort now
+   escapes the no-drink death spiral). Kitchen bans (booze/honey/tallow/
+   seeds) + `reserved_barrels = 5` at startup. `ITEM_TOOL_LARGE_POT` added
+   to compat tools.
+4. **Ghosts & coffins** — `update_deads` implemented (was an empty stub):
+   ghostly units -> `queue_slab` (dead code since r3.8, now wired), coffin
+   census 3 + dead citizens -> `getcoffin`.
+5. **Noble quality** — `attribute_noblerooms` gates rooms on the position's
+   required_tomb/dining/bedroom/office and sets `required_value` (max over
+   positions); `smooth_room` is now C++ plan_smooth parity: interior + 1-tile
+   shell, stone/mineral only, smooth=1 then engrave=2 escalation,
+   block designated flag. `monitor_room_value` finally has a live input.
+6. **Camera** — C++ camera.cpp priority classes (beasts > hostiles >
+   citizens sorted by job-boredom score), anti-repeat (last 3), real
+   `plotinfo.follow_unit` writes, fps_meter config honored.
+7. **Commands** — `df-ai enable/disable events|camera` are real toggles
+   (were print-only stubs); `df-ai report` also writes C++'s
+   `df-ai-report.log`; new `df-ai validate` (blueprints folder check);
+   JSON event stream (`df-ai-events.json`) with new/del-citizen emitters.
+8. **Trading gate** — caravan detection now requires
+   `trade_state == AtDepot` (was: any caravan announcement).
+
+### Verification
+
+- NEW test/test_parity_r310.lua: 31 checks — full persistence round-trip
+  (identity of cross-references: accesspath, stockpile->workshop,
+  lever->floodgate, task->room/furniture), site rejection, latch restore,
+  nil tolerance.
+- Full suite green: unit_fixes (camera mock updated to units.active),
+  ci_smoke (persist module loads), blueprint engine, big-map perf.
+- syntax: luac5.3 -p clean on all 14 scripts.

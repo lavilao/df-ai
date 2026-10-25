@@ -266,6 +266,20 @@ end
 
 function Stocks:startup()
     self:count_stocks()
+    -- C++ Stocks::startup parity (r3.10):
+    --   * ban cooking booze/honey/tallow/seeds — otherwise the kitchen
+    --     happily boils the drink supply into roasts (slow starvation)
+    --   * reserve 5 barrels for drink production
+    pcall(function()
+        dfhack.run_command('ban-cooking booze honey tallow seeds')
+        dfhack.println('[df-ai] kitchen bans: booze honey tallow seeds')
+    end)
+    pcall(function()
+        local sp = df.global.plotinfo.stockpile
+        if sp and sp.reserved_barrels then
+            sp.reserved_barrels = 5
+        end
+    end)
 end
 
 function Stocks:update()
@@ -321,6 +335,76 @@ end
 -- Stock counting
 -- ============================================================
 
+-- C++ Stocks::is_item_free parity (r3.10). An item only counts as
+-- usable stock when the fort can actually use it: not the merchant's,
+-- not built into a construction, not forbidden/dumped, not sitting in
+-- an infirmary chest, not in a non-hauling job, not worn (hauled is
+-- fine), and containers only count when EMPTY (a barrel full of drink
+-- is not a free barrel).
+local function is_item_free(item)
+    local ok, free = pcall(function()
+        local f = item.flags
+        if f.trader or f.construction or f.encased or f.removed
+            or f.forbid or f.dump or f.in_chest then
+            return false
+        end
+        if f.in_job then
+            -- hauling jobs keep the item available; everything else
+            -- (building, eating, ...) means it is spoken for
+            local job = nil
+            for _, ref in ipairs(item.specific_refs or {}) do
+                pcall(function()
+                    if ref.type == df.specific_ref_type.JOB then
+                        job = ref.data.job
+                    end
+                end)
+            end
+            if not job then return false end
+            local cls = nil
+            pcall(function()
+                cls = df.job_type.attrs[job.job_type].type
+            end)
+            if cls == nil or cls ~= df.job_type_class.Hauling then
+                return false
+            end
+        end
+        if f.in_inventory then
+            -- inside a unit's inventory = worn/eaten (not free); simply
+            -- being hauled or inside a barrel stays free
+            for _, ir in ipairs(item.general_refs or {}) do
+                local is_holder = false
+                pcall(function()
+                    is_holder = df.general_ref_unit_holderst:is_instance(ir)
+                end)
+                if is_holder then
+                    local u = nil
+                    pcall(function() u = ir:getUnit() end)
+                    if u then
+                        for _, ii in ipairs(u.inventory or {}) do
+                            if ii.item == item
+                                and ii.mode ~= df.unit_inventory_item.T_mode.Hauled then
+                                return false
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        if f.container then
+            -- a container only counts when empty
+            for _, ir in ipairs(item.general_refs or {}) do
+                local contains = false
+                pcall(function()
+                    contains = df.general_ref_contains_itemst:is_instance(ir)
+                end)
+                if contains then return false end
+            end
+        end
+        return true
+    end)
+    return ok and free or false
+end
+
 function Stocks:count_stocks()
     local world = df.global.world
     if not world then return end
@@ -333,11 +417,18 @@ function Stocks:count_stocks()
     for _, item in ipairs(items) do
         local k = classify_item(item)
         if k then
-            total[k] = (total[k] or 0) + 1
-
-            -- Items hauled by jobs don't count as "free"
-            if not compat.item_in_job(item) then
-                free[k] = (free[k] or 0) + 1
+            -- r3.10: C++ counts STACKS (a barrel of 25 drinks is 25
+            -- drinks, an ammo stack is 25 bolts) — counting 1 per item
+            -- under-counted drinks/ammo/meals/seeds by 5-25x
+            local n = 1
+            pcall(function()
+                if item.stack_size and item.stack_size > 1 then
+                    n = item.stack_size
+                end
+            end)
+            total[k] = (total[k] or 0) + n
+            if is_item_free(item) then
+                free[k] = (free[k] or 0) + n
             end
         end
 
@@ -348,28 +439,46 @@ function Stocks:count_stocks()
         if t == IT.BAR or t == IT.BOULDER then
             local tok = mat_token(item)
             if tok then
+                local n2 = 1
+                pcall(function()
+                    if item.stack_size and item.stack_size > 1 then
+                        n2 = item.stack_size
+                    end
+                end)
                 if t == IT.BAR then
-                    total['bar_' .. tok] = (total['bar_' .. tok] or 0) + 1
-                    free['bar_' .. tok] = (free['bar_' .. tok] or 0) + 1
+                    total['bar_' .. tok] = (total['bar_' .. tok] or 0) + n2
+                    if is_item_free(item) then
+                        free['bar_' .. tok] = (free['bar_' .. tok] or 0) + n2
+                    end
                     if tok:find('COAL') or tok:find('CHARCOAL') then
-                        total.coal = (total.coal or 0) + 1
-                        free.coal = (free.coal or 0) + 1
+                        total.coal = (total.coal or 0) + n2
+                        if is_item_free(item) then
+                            free.coal = (free.coal or 0) + n2
+                        end
                     end
                     if tok:find('ASH') then
-                        total.ash = (total.ash or 0) + 1
-                        free.ash = (free.ash or 0) + 1
+                        total.ash = (total.ash or 0) + n2
+                        if is_item_free(item) then
+                            free.ash = (free.ash or 0) + n2
+                        end
                         if tok:find('POTASH') then
-                            total.potash = (total.potash or 0) + 1
-                            free.potash = (free.potash or 0) + 1
+                            total.potash = (total.potash or 0) + n2
+                            if is_item_free(item) then
+                                free.potash = (free.potash or 0) + n2
+                            end
                         end
                     end
                     if tok:find('SOAP') then
-                        total.soap = (total.soap or 0) + 1
-                        free.soap = (free.soap or 0) + 1
+                        total.soap = (total.soap or 0) + n2
+                        if is_item_free(item) then
+                            free.soap = (free.soap or 0) + n2
+                        end
                     end
                 else
-                    total['ore_' .. tok] = (total['ore_' .. tok] or 0) + 1
-                    free['ore_' .. tok] = (free['ore_' .. tok] or 0) + 1
+                    total['ore_' .. tok] = (total['ore_' .. tok] or 0) + n2
+                    if is_item_free(item) then
+                        free['ore_' .. tok] = (free['ore_' .. tok] or 0) + n2
+                    end
                 end
             end
         end
@@ -719,7 +828,23 @@ end
 function Stocks:queue_food_orders(item_key, amount)
     amount = amount or 10
     if item_key == nil or item_key == 'drink' then
-        self:queue_reaction(compat.reaction.BrewDrink, amount)
+        -- C++ queue_need drink chain (r3.10):
+        --   * brew orders count BREWS, each yields 5 drinks -> (n+4)/5
+        --   * refuses to queue without barrels/pots: queue pots instead
+        --     (a fort with no free container NEVER gets any drink)
+        local containers = (self.count_free.barrel or 0)
+            + (self.count_free.food_storage or 0)
+        if containers <= 0 then
+            -- MakeTool with the food-storage (large pot) subtype
+            local sub = compat.tool_subtype('FOOD_STORAGE')
+            if sub and sub >= 0 then
+                self:queue_order(df.job_type.MakeTool, IT.TOOL, sub, 2)
+            else
+                self:queue_order(df.job_type.MakeBarrel, IT.BARREL, -1, 2)
+            end
+            return
+        end
+        self:queue_reaction(compat.reaction.BrewDrink, math.ceil(amount / 5))
     end
 
     if item_key == nil or item_key == 'meal' then

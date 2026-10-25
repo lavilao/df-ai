@@ -230,11 +230,19 @@ function Population:update_citizenlist()
             if not new_citizens[uid] then
                 pcall(function() plan:del_citizen(uid) end)
                 self._pending_rooms[uid] = nil
+                -- C++ event stream (ai enable events): every citizen
+                -- addition/removal was recorded in df-ai-events.json
+                if self.ai and self.ai.event then
+                    self.ai:event('del citizen', { unit = uid })
+                end
             end
         end
         for uid in pairs(new_citizens) do
             if not old[uid] then
                 self._pending_rooms[uid] = true
+                if self.ai and self.ai.event then
+                    self.ai:event('new citizen', { unit = uid })
+                end
             end
         end
         -- (re)assign rooms for every citizen that still needs them.
@@ -1182,6 +1190,7 @@ function Population:check_noble_apartments()
     end
     local ok, err = pcall(function()
         local noble_ids = {}
+        local pos_by_uid = {}
         for _, asn in ipairs(ent.positions.assignments) do
             if asn.histfig ~= -1 then
                 local pos
@@ -1189,10 +1198,12 @@ function Population:check_noble_apartments()
                     if p.id == asn.position_id then pos = p break end
                 end
                 if pos and (pos.required_office > 0 or pos.required_dining > 0
-                    or pos.required_tomb > 0) then
+                    or pos.required_tomb > 0 or pos.required_bedroom > 0) then
                     local hf = df.historical_figure.find(asn.histfig)
                     if hf and hf.unit_id ~= -1 then
                         noble_ids[hf.unit_id] = true
+                        pos_by_uid[hf.unit_id] = pos_by_uid[hf.unit_id] or {}
+                        table.insert(pos_by_uid[hf.unit_id], pos)
                     end
                 end
             end
@@ -1201,7 +1212,7 @@ function Population:check_noble_apartments()
         for uid in pairs(noble_ids) do
             table.insert(id_list, uid)
         end
-        self.ai.plan:attribute_noblerooms(id_list)
+        self.ai.plan:attribute_noblerooms(id_list, pos_by_uid)
     end)
     if not ok then
         dfhack.printerr('[df-ai:nobles] apartments failed: ' .. tostring(err))
@@ -1715,8 +1726,18 @@ function Population:update_trading()
     if not ok or not plotinfo then return end
     local caravan = plotinfo.caravans
     if not caravan then return end
+    -- C++ Trade::can_move_entities gating (r3.10): only a caravan that
+    -- has REACHED the depot counts ("Approaching"/"AtDepot" trade_state
+    -- — the old check fired the trade flow on the first announcement,
+    -- long before any goods could be moved)
+    local TRADE_STATE_AT_DEPOT = nil
+    pcall(function() TRADE_STATE_AT_DEPOT = df.caravan_state.T_trade_state.AtDepot end)
     for _, c in ipairs(caravan) do
-        if c.time_remaining and c.time_remaining > 0 then
+        local at_depot = true
+        if TRADE_STATE_AT_DEPOT ~= nil and c.trade_state ~= nil then
+            at_depot = (c.trade_state == TRADE_STATE_AT_DEPOT)
+        end
+        if at_depot and c.time_remaining and c.time_remaining > 0 then
             if not self.did_trade then
                 self.did_trade = true
                 self:set_up_trading(true)
@@ -1790,7 +1811,72 @@ end
 -- Deaths
 -- ============================================================
 
+-- C++ population_death.cpp update_deads parity (r3.10):
+--   * ghostly units get a memorial slab queued (queue_slab was fully
+--     implemented in stocks.lua since r3.8 but had ZERO callers —
+--     ghosts kept haunting the halls forever)
+--   * coffin census: want 3 + dead citizens; when short, ask the plan
+--     for another coffin (deathwatch only reacts to death-count
+--     changes; this pass catches restored saves too)
 function Population:update_deads()
+    local world = df.global.world
+    if not world then return end
+
+    local plan = self.ai and self.ai.plan
+    local stocks = self.ai and self.ai.stocks
+    if not plan or not plan.setup_done then return end
+
+    pcall(function()
+        -- ghosts -> memorial slabs (one scan, pcall per unit: flags3
+        -- layout drift must never kill the deathwatch)
+        local seen_slab = self._ghost_slabs or {}
+        for _, unit in ipairs(world.units.all) do
+            local ghostly = false
+            pcall(function() ghostly = unit.flags3.bits.ghostly end)
+            if ghostly then
+                local hf = unit.hist_figure_id
+                if hf and hf >= 0 and not seen_slab[hf] and stocks
+                    and stocks.queue_slab then
+                    if stocks:queue_slab(hf) then
+                        seen_slab[hf] = true
+                        dfhack.println('[df-ai] ghost spotted: queueing a '
+                            .. 'memorial slab (histfig ' .. tostring(hf) .. ')')
+                    end
+                end
+            end
+        end
+        self._ghost_slabs = seen_slab
+
+        -- coffin census (C++: 3 baseline + dead citizens, minus planned)
+        if plan.getcoffin then
+            local dead_citizens = 0
+            for _, unit in ipairs(world.units.all) do
+                local dead = false
+                local own = false
+                pcall(function()
+                    dead = not dfhack.units.isAlive(unit)
+                    own = dfhack.units.isCitizen(unit, false)
+                end)
+                if dead and own then
+                    dead_citizens = dead_citizens + 1
+                end
+            end
+            local want = 3 + dead_citizens
+            local have = 0
+            for _, r in ipairs(plan.room_category['cemetery'] or {}) do
+                if r.status ~= 'plan' then
+                    for _, f in ipairs(r.layout or {}) do
+                        if f.type == 'coffin' and not f.ignore then
+                            have = have + 1
+                        end
+                    end
+                end
+            end
+            if have < want then
+                plan:getcoffin()
+            end
+        end
+    end)
 end
 
 -- ============================================================

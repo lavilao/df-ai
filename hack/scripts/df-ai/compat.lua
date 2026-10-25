@@ -164,6 +164,8 @@ compat.tool = {
     JUG         = 'ITEM_TOOL_JUG',
     PICK        = 'ITEM_TOOL_PICK',
     AXE         = 'ITEM_TOOL_AXE',
+    -- C++ stock_item::food_storage — the large pot (brewing container)
+    FOOD_STORAGE = 'ITEM_TOOL_LARGE_POT',
 }
 
 function compat.tool_subtype(name)

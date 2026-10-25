@@ -4,6 +4,7 @@ local json = require('json')
 local rooms_module = nil
 local blueprint_module = nil
 local priorities_module = nil
+local persist_module = nil
 -- forward declaration: the dig-pipeline block below runs before the
 -- logging helpers are (lexically) defined — without this the upvalue
 -- resolves to a nil global at runtime
@@ -89,6 +90,29 @@ end
 
 function Plan:startup()
     self:load_rooms_module()
+    -- r3.10 (C++ plan_persist.cpp parity): a plan restored from the world
+    -- save replaces the whole blueprint setup. Without this, every
+    -- save+reload re-placed the fortress over the existing one (duplicate
+    -- bedrooms, doubled traps, corridors re-dug through workshops).
+    if persist_module and not self.setup_done then
+        if persist_module.load(self, rooms_module,
+            self.ai and self.ai.population,
+            function(msg) self:_log(msg) end) then
+            -- rebuild priority rules from the plan JSON, then restore
+            -- their working latches (the rules themselves are static;
+            -- only `working` is stateful)
+            if priorities_module then
+                self:load_plan_config()
+                if self.plan_config and self.plan_config.priorities then
+                    self.priority_rules = priorities_module.prepare(self.plan_config.priorities)
+                    persist_module.restore_priority_state(self)
+                end
+            end
+            self:_log('setup complete (restored): ' .. #self.rooms
+                .. ' rooms, ' .. #self.corridors .. ' corridors')
+            return
+        end
+    end
     self:load_blueprint()
     if self.builder_started then return end
     if self:plan_setup() then
@@ -112,6 +136,25 @@ function Plan:load_rooms_module()
     if okb then blueprint_module = modb end
     local okp, modp = pcall(dfhack.run_script_with_env, nil, 'df-ai/priorities', {module=true})
     if okp then priorities_module = modp end
+    local okpers, modpers = pcall(dfhack.run_script_with_env, nil, 'df-ai/persist', {module=true})
+    if okpers then persist_module = modpers end
+end
+
+-- Just the plan JSON (no templates) — enough for the priority rules on
+-- the persistence-restore path.
+function Plan:load_plan_config()
+    self.plan_config = nil
+    for _, path in ipairs({
+        'df-ai-blueprints/plans/generic01.json',
+        'df-ai-53.16-r3/df-ai-blueprints/plans/generic01.json',
+        'plans/generic01.json',
+    }) do
+        local ok_p, p = pcall(json.decode_file, path)
+        if ok_p and p then
+            self.plan_config = p
+            return
+        end
+    end
 end
 
 function Plan:update()
@@ -1138,19 +1181,42 @@ end
 
 function Plan:smooth_room(r)
     if not r then return end
-    -- Queue smoothing jobs for all diggable tiles in the room
-    for x = r.min.x, r.max.x do
-        for y = r.min.y, r.max.y do
-            for z = r.min.z, r.max.z do
-                local block = dfhack.maps.getTileBlock(x, y, z)
-                if block then
-                    local tile = block.tiletype[x % 16][y % 16]
-                    local attrs = df.tiletype.attrs[tile]
-                    if attrs and attrs.shape == df.tiletype_shape.WALL then
-                        -- Queue smooth designation
-                        local des = block.designation[x % 16][y % 16]
-                        if des then
-                            des.smooth = true
+    -- C++ plan_smooth.cpp parity (r3.10): smooth the room interior PLUS
+    -- the 1-tile shell ring, walls and floors, stone/mineral only. Each
+    -- monitor pass upgrades every eligible tile one step
+    -- (0 -> smooth=1 -> engrave=2), which is exactly the C++ "smooth
+    -- first, then engrave" escalation for noble rooms whose computed
+    -- value is still short of required_value.
+    local SM_STONE = df.tiletype_material.STONE
+    local SM_MINERAL = df.tiletype_material.MINERAL
+    for z = r.min.z, r.max.z do
+        for x = r.min.x - 1, r.max.x + 1 do
+            for y = r.min.y - 1, r.max.y + 1 do
+                local ok_b, block = pcall(dfhack.maps.getTileBlock, x, y, z)
+                if ok_b and block then
+                    local lx, ly = x % 16, y % 16
+                    local tt = block.tiletype[lx][ly]
+                    local des = block.designation[lx][ly]
+                    if tt ~= nil and des ~= nil then
+                        local ok_m, mat = pcall(function()
+                            return df.tiletype.attrs[tt].material end)
+                        local ok_h, hidden = pcall(function()
+                            return des.d.hidden end)
+                        local ok_d, dig = pcall(function()
+                            return des.dig end)
+                        if ok_m and (mat == SM_STONE or mat == SM_MINERAL)
+                            and not (ok_h and hidden)
+                            and not (ok_d and dig ~= df.tile_dig_designation.No) then
+                            if des.smooth == 0 or des.smooth == false then
+                                des.smooth = 1
+                                block.flags.designated = true
+                            elseif des.smooth == 1 or des.smooth == true then
+                                -- already smoothed: escalate to engraving
+                                if des.smooth == 1 then
+                                    des.smooth = 2
+                                    block.flags.designated = true
+                                end
+                            end
                         end
                     end
                 end
@@ -2007,6 +2073,19 @@ function Plan:try_furnish(r, f)
     if ok and bld then
         f.bld_id = bld.id
         f._wait_reason = nil
+        -- C++ try_furnish_archerytarget: aim direction from the target's
+        -- position — without it v50 archery targets are unusable for
+        -- practice (no valid firing direction)
+        if f.type == 'archery_target' then
+            pcall(function()
+                if df.building_archerytargetst:is_instance(bld)
+                    and df.building_archerytargetst.TopToBottom then
+                    bld.archery_direction = (pos.y > 2)
+                        and df.building_archerytargetst.TopToBottom
+                        or df.building_archerytargetst.BottomToTop
+                end
+            end)
+        end
         self:_log('placed ' .. tostring(f.type) .. ' at '
             .. pos.x .. ',' .. pos.y .. ',' .. pos.z
             .. ' (bld ' .. bld.id .. ')')
@@ -2806,17 +2885,23 @@ function Plan:freesoldierbarrack(unit_id)
 end
 
 -- C++ Plan:attribute_noblerooms — noble suites for position holders
--- (office/dining/bedroom/tomb per required_* of the position)
-function Plan:attribute_noblerooms(id_list)
+-- (office/dining/bedroom/tomb per required_* of the position).
+-- pos_by_uid (optional, from Population:check_noble_apartments) maps
+-- unit id -> list of position objects; rooms only dig + gain
+-- required_value for subtypes the noble's position actually requires
+-- (C++ DIG_ROOM_IF gates).
+function Plan:attribute_noblerooms(id_list, pos_by_uid)
     if not id_list or #id_list == 0 then return end
     local rooms = self.room_category['nobleroom']
     if not rooms then return end
 
-    -- free suites owned by now-removed nobles
+    -- free suites owned by now-removed nobles (and drop their value
+    -- requirement — C++ sets required_value = 0 on release)
     local keep = {}
     for _, uid in ipairs(id_list) do keep[uid] = true end
     for _, r in ipairs(rooms) do
         if r.owner >= 0 and not keep[r.owner] then
+            r.required_value = 0
             self:set_owner(r, -1)
         end
     end
@@ -2836,11 +2921,40 @@ function Plan:attribute_noblerooms(id_list)
             end
         end
         if base then
-            -- claim the whole suite (same noblesuite number)
+            -- claim the whole suite (same noblesuite number), but each
+            -- room only digs when the position requires its subtype
+            local positions = pos_by_uid and pos_by_uid[uid] or nil
             for _, r in ipairs(rooms) do
                 if r.noblesuite == base.noblesuite and r.owner < 0 then
                     self:set_owner(r, uid)
-                    self:wantdig(r, -2)
+                    local wanted = false
+                    if positions then
+                        local req_field = ({
+                            tomb = 'required_tomb',
+                            dining = 'required_dining',
+                            bedroom = 'required_bedroom',
+                            office = 'required_office',
+                        })[r.nobleroom_type]
+                        if req_field then
+                            for _, pos in ipairs(positions) do
+                                local ok_v, req = pcall(function()
+                                    return pos[req_field] end)
+                                if ok_v and req and req > 0 then
+                                    wanted = true
+                                    if req > (r.required_value or 0) then
+                                        r.required_value = req
+                                    end
+                                end
+                            end
+                        end
+                    else
+                        -- no position info: claim + dig everything (the
+                        -- pre-r3.10 behavior)
+                        wanted = true
+                    end
+                    if wanted then
+                        self:wantdig(r, -2)
+                    end
                 end
             end
         end

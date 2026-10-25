@@ -646,7 +646,12 @@ do
     check(c.enabled, 'camera enabled from config')
 
     df_mock.global.world = {
-        units = { all = dfvec({ { id = 7, citizen = true, alive = true, pos = { x = 11, y = 22, z = 3 } } }) },
+        units = {
+            -- r3.10 camera reads units.active (C++ Camera::update parity);
+            -- all is kept for the other consumers
+            all = dfvec({ { id = 7, citizen = true, alive = true, pos = { x = 11, y = 22, z = 3 } } }),
+            active = dfvec({ { id = 7, citizen = true, alive = true, pos = { x = 11, y = 22, z = 3 } } }),
+        },
     }
     df_mock.unit = {
         find = function(id)

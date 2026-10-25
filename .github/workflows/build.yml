@@ -58,6 +58,9 @@ jobs:
       - name: Blueprint engine tests (headless placement + priorities)
         run: lua5.3 test/test_blueprint_engine.lua
 
+      - name: Persistence round-trip tests (r3.10 plan_persist parity)
+        run: lua5.3 test/test_parity_r310.lua
+
       - name: Big-map performance regression (r3.8 perf rework)
         run: lua5.3 test/test_perf_bigmap.lua
 
