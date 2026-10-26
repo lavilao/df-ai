@@ -634,9 +634,9 @@ do
 end
 
 -- ============================================================
--- 7. Camera: 3-value getPosition + v50 view panning
+-- 7. Camera: 3-value getPosition + r3.11 manual-control yield
 -- ============================================================
-print('--- Camera: 3-value getPosition + v50 view ---')
+print('--- Camera: pick reveals once, tracking silent, manual yield ---')
 do
     local ok_cam, Camera = pcall(dfhack_mock.run_script_with_env, nil, 'df-ai/camera', { module = true })
     check(ok_cam, 'camera module loads')
@@ -661,6 +661,11 @@ do
     }
     df_mock.global.cursor = make_struct({ x = 0, y = 0, z = 0 }, {})
 
+    -- mutable follow_unit: the r3.11 manual-yield contract needs it
+    local saved_plotinfo = df_mock.global.plotinfo
+    local follow_backing = { follow_unit = -1 }
+    df_mock.global.plotinfo = make_struct(follow_backing, {})
+
     local revealed = {}
     dfhack_mock.gui.revealInDwarfmodeMap = function(pos, hl, zoom)
         revealed[#revealed + 1] = { pos = pos, hl = hl, zoom = zoom }
@@ -670,16 +675,42 @@ do
     check(ok_c1, 'camera update does not crash (r3.3 threw on pos.x)')
     check(#revealed == 1 and revealed[1].pos.x == 11
         and revealed[1].pos.y == 22 and revealed[1].pos.z == 3,
-        'camera pans the v50 view to the followed dwarf')
+        'picking a target pans the v50 view to the followed dwarf')
+    check(follow_backing.follow_unit == 7,
+        'follow_unit written to the game (the real follow)')
     check(df_mock.global.cursor.x == 0 and df_mock.global.cursor.y == 0,
         'reveal path used, cursor not scribbled')
 
-    -- reveal missing -> falls back to cursor writes without crashing
-    dfhack_mock.gui.revealInDwarfmodeMap = nil
+    -- tracking: while follow_unit stays ours the camera must NOT re-pan
+    for _ = 1, 5 do c:update() end
+    check(#revealed == 1,
+        'tracking does not re-pan every update (r3.10 yanked the view back)')
+
+    -- the player pans away: the game clears follow_unit
+    follow_backing.follow_unit = -1
     local ok_c2 = pcall(function() c:update() end)
-    check(ok_c2, 'camera update survives a missing reveal API')
-    check(df_mock.global.cursor.x == 11 and df_mock.global.cursor.z == 3,
+    check(ok_c2, 'camera update survives the manual pan')
+    check(#revealed == 1,
+        'manual pan is respected: no reveal after the user moves the camera')
+    check(c.hold_calls > 0, 'following suspends (manual-control cooldown)')
+
+    for _ = 1, 10 do c:update() end
+    check(#revealed == 1, 'cooldown keeps hands off the camera')
+
+    -- after the cooldown expires the rotation picks a target again
+    for _ = 1, 120 do c:update() end
+    check(#revealed >= 2, 'autonomous following resumes after the cooldown')
+
+    -- reveal API missing -> the cursor fallback still works on demand
+    dfhack_mock.gui.revealInDwarfmodeMap = nil
+    follow_backing.follow_unit = -1
+    local ok_c3 = pcall(function() c:update() end)
+    check(ok_c3, 'camera update survives a missing reveal API')
+    local ok_rv = pcall(function() c:reveal(df_mock.unit.find(7)) end)
+    check(ok_rv and df_mock.global.cursor.x == 11 and df_mock.global.cursor.z == 3,
         'cursor fallback wrote the followed dwarf position')
+
+    df_mock.global.plotinfo = saved_plotinfo
 end
 
 -- ============================================================

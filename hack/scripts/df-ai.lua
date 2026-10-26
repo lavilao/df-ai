@@ -84,6 +84,11 @@ local function default_config()
         allow_pause = true,
         -- r3.9 (C++ parity): turn the minimap overlay off at startup
         disable_minimap = true,
+        -- r3.11: trade automation. Marking goods when the trade screen
+        -- opens is always on; the auto-confirm keypress starts OFF (it
+        -- simulates SEC_SELECT — enable with `df-ai enable trade_confirm`
+        -- once verified on your build).
+        trade_confirm = false,
     }
 end
 
@@ -1049,7 +1054,7 @@ local function print_status()
 end
 
 local function print_version()
-    print('df-ai Lua rewrite for DF 53.16 (DFHack 53.16-r3) — build r3.10')
+    print('df-ai Lua rewrite for DF 53.16 (DFHack 53.16-r3) — build r3.11')
     print('Based on BenLubar/df-ai')
 end
 
@@ -1057,10 +1062,15 @@ end
 -- real toggles; lockstep is C-only memory patching and cannot exist in
 -- a Lua plugin.
 local function handle_toggle(sub, enable)
-    local option_labels = { events = 'events stream', camera = 'camera control' }
+    local option_labels = {
+        events = 'events stream',
+        camera = 'camera control',
+        trade_confirm = 'trade auto-confirm',
+    }
     local label = option_labels[sub]
     if not label then
-        print('unknown option: ' .. tostring(sub) .. ' (known: events, camera)')
+        print('unknown option: ' .. tostring(sub)
+            .. ' (known: events, camera, trade_confirm)')
         return
     end
     if not the_ai then
@@ -1077,6 +1087,9 @@ local function handle_toggle(sub, enable)
                 the_ai.camera:startup()
             end
         end
+        save_config(the_ai.config)
+    elseif sub == 'trade_confirm' then
+        the_ai.config.trade_confirm = enable
         save_config(the_ai.config)
     end
     print('df-ai ' .. label .. (enable and ' enabled' or ' disabled'))
@@ -1133,6 +1146,8 @@ Usage:
                             items, priority rules in progress.
   df-ai report              Write a full JSON report to df-ai-report.json.
   df-ai embark              Manually trigger one auto-embark attempt.
+  df-ai enable <option>     Toggle: events, camera, trade_confirm.
+  df-ai disable <option>    Same options reversed.
   df-ai version             Build information.
 
 Config file: dfhack-config/df-ai.json
@@ -1142,6 +1157,10 @@ Config file: dfhack-config/df-ai.json
                             each has its own dfhack_tools_<name> key)
   embark_continue_fort      true — prefer loading your latest fort save
   camera                    true — camera follows interesting events
+                            (yields for ~2 min whenever you pan manually)
+  trade_confirm             false — auto-press Trade after marking goods;
+                            goods auto-mark whenever the trade screen is
+                            open and a caravan sits at the depot
 
 Blueprints: df-ai-blueprints/ must sit inside your DF directory
 (plans/, templates/, instances/).]]

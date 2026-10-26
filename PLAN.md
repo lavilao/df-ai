@@ -102,3 +102,28 @@ Phase 0  Core Infrastructure
 | Enemy tagging | `df-ai.lua` |
 | Camera follow history | `camera.lua` |
 | Persist/unpersist | `plan.lua` |
+
+## Status — r3.11 (updated pending list)
+
+Parity with the C++ build is now complete for: blueprints + priorities,
+construction, manager orders (stocks), farms, military drafting + kill
+orders, pets, nobles, justice detection, ghosts, persistence (NEW — did
+not exist in C++), camera (now with manual-control yield the C++ build
+never had), the idler sweep, and trade goods marking (via the mapped
+v50+ trade UI).
+
+### Pending
+
+| Item | State | Next step |
+|---|---|---|
+| Trade auto-confirm | SEC_SELECT keypress implemented, OFF by default | verify on live build (`df-ai enable trade_confirm`) during a caravan visit |
+| Trade screen auto-open | NOT implemented | drive cursor to depot + press the Trade button from `main_interface.building.button` (`:press()` vmethod); needs live verification |
+| Broker dispatch to depot | NOT implemented | job creation from Lua (dfhack.jobs + job refs); riskiest piece |
+| Weblegends | blocked | plugin does not exist for DFHack 53.16 |
+| lockstep movie log | by design | C-only memory patching, cannot exist in Lua |
+| Justice auto-conviction | partial (detection only) | conviction screens need UI driving |
+| Occupations writes | skipped by choice | struct writes risk save corruption |
+| Cistern deep-channelling | partial | port plan_cistern.cpp channel sequencing |
+| Soldier tool confiscation | missing | stocks_equipment follow-up |
+| Caged-prisoner pit pipeline | missing | population follow-up |
+| autolabor mismatch (rare "unit doing Fish") | low priority | reproduce, then report upstream |

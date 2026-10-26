@@ -46,6 +46,19 @@ local LABOR_BASIC = {
     [df.unit_labor.COOK] = true,
     [df.unit_labor.BREWER] = true,
     [df.unit_labor.HAUL_STONE] = true,
+    -- r3.11: the pre-r3.11 list had ONLY HAUL_STONE — dwarves stood next
+    -- to wood/food/furniture to haul with nothing to haul it with and the
+    -- user kept seeing idlers. Every hauling labor goes on everyone.
+    [df.unit_labor.HAUL_ITEM] = true,
+    [df.unit_labor.HAUL_WOOD] = true,
+    [df.unit_labor.HAUL_FOOD] = true,
+    [df.unit_labor.HAUL_BODY] = true,
+    [df.unit_labor.HAUL_REFUSE] = true,
+    [df.unit_labor.HAUL_FURNITURE] = true,
+    [df.unit_labor.HAUL_ANIMALS] = true,
+    [df.unit_labor.HAUL_TRADE] = true,
+    [df.unit_labor.HAUL_WATER] = true,
+    [df.unit_labor.HANDLE_VEHICLES] = true,
 }
 
 -- Nobles we track
@@ -107,7 +120,7 @@ end
 
 function Population:update()
     self.update_counter = self.update_counter + 1
-    local phase = self.update_counter % 12
+    local phase = self.update_counter % 13
     if phase == 0 then
         self:update_trading()
     elseif phase == 1 then
@@ -132,6 +145,9 @@ function Population:update()
         self:update_labors()
     elseif phase == 11 then
         self:update_assignments()
+    elseif phase == 12 then
+        -- r3.11: the idler sweep (see check_idle below)
+        self:check_idle()
     end
 end
 
@@ -1742,11 +1758,20 @@ function Population:update_trading()
                 self.did_trade = true
                 self:set_up_trading(true)
             end
+            -- r3.11: drive the trade module while the caravan sits at the
+            -- depot (it polls the mapped v50+ trade UI for the open screen)
+            if self.ai.trade and self.ai.trade.perform then
+                pcall(function() self.ai.trade:perform() end)
+            end
             return
         end
     end
     if self.did_trade then
         self.did_trade = false
+        -- caravan left: re-arm for the next visit
+        if self.ai.trade and self.ai.trade.reset then
+            pcall(function() self.ai.trade:reset() end)
+        end
     end
 end
 
@@ -1804,6 +1829,131 @@ function Population:update_jobs()
         self._unsuspend_total = (self._unsuspend_total or 0) + unsuspended
         dfhack.println(('[df-ai] unsuspended %d stalled job(s) (%d total this session)')
             :format(unsuspended, self._unsuspend_total))
+    end
+end
+
+-- ============================================================
+-- Idler sweep (r3.11 — "no dejar enanos en idle")
+--
+-- The r3.9 anti-idle only un-suspended stalled jobs; the user still saw
+-- idlers. This sweep attacks every fixable cause of a dwarf standing
+-- around with no current job:
+--   1. missing hauling labors (pre-r3.11 LABOR_BASIC had only
+--      HAUL_STONE) — fixed on the spot for anyone idle
+--   2. an open, unsuspended, UNASSIGNED job whose labor nobody present
+--      has (classic autolabor gap: the mason is busy, the new migrant
+--      never got the labor) — enable that labor on an idle dwarf
+--   3. lots of idlers and NOTHING open at all — the order pipeline is
+--      the bottleneck, so poke the stocks engine for an early audit
+-- Cadence: phase 12 of the population wheel (~every 325 ticks).
+-- ============================================================
+
+local HAUL_LABORS = {
+    df.unit_labor.HAUL_ITEM, df.unit_labor.HAUL_WOOD,
+    df.unit_labor.HAUL_FOOD, df.unit_labor.HAUL_BODY,
+    df.unit_labor.HAUL_REFUSE, df.unit_labor.HAUL_FURNITURE,
+    df.unit_labor.HAUL_ANIMALS, df.unit_labor.HAUL_TRADE,
+    df.unit_labor.HAUL_WATER, df.unit_labor.HANDLE_VEHICLES,
+}
+
+function Population:check_idle()
+    local world = df.global.world
+    if not world or not world.units or not world.units.active then return end
+    if self.ai and self.ai.config and self.ai.config.manage_labors == 'none' then
+        return -- the player owns labor management in that mode
+    end
+
+    -- 1) who has no job right now
+    local idle = {}
+    for _, u in ipairs(world.units.active) do
+        local ok, is_idle = pcall(function()
+            if not dfhack.units.isCitizen(u, true) then return false end
+            if not dfhack.units.isAlive(u) then return false end
+            local f1 = u.flags1 and u.flags1.bits
+            if f1 and (f1.inactive or f1.sleep or f1.unconscious or f1.caged) then
+                return false
+            end
+            if dfhack.units.isBaby(u) or dfhack.units.isChild(u) then return false end
+            if u.job and u.job.current_job then return false end
+            return true
+        end)
+        if ok and is_idle then idle[u.id] = u end
+    end
+    local count = 0
+    for _ in pairs(idle) do count = count + 1 end
+    if count == 0 then
+        self._idle_nudged_day = nil
+        return
+    end
+
+    -- 2) hauling labors on every idle dwarf that lacks them
+    local haul_fixed = 0
+    for _, u in pairs(idle) do
+        if u.status and u.status.labors then
+            local changed = false
+            for _, labor in ipairs(HAUL_LABORS) do
+                if u.status.labors[labor] ~= true then
+                    u.status.labors[labor] = true
+                    changed = true
+                end
+            end
+            if changed then haul_fixed = haul_fixed + 1 end
+        end
+    end
+
+    -- 3) match idle dwarves to open unassigned jobs by labor
+    local matched = 0
+    local MAX_MATCH = 4 -- cap per sweep: autolabor owns the big picture
+    if world.jobs and world.jobs.list then
+        for _, job in ipairs(world.jobs.list) do
+            if matched >= MAX_MATCH then break end
+            local okj, labor = pcall(function()
+                if not job or not job.flags or job.flags.bits.suspend then
+                    return nil
+                end
+                if dfhack.jobs.getWorker and dfhack.jobs.getWorker(job) then
+                    return nil -- somebody is already on it
+                end
+                local attrs = df.job_type.attrs and df.job_type.attrs[job.job_type]
+                return attrs and attrs.labor or nil
+            end)
+            if okj and labor and labor ~= -1 and labor ~= df.unit_labor.NONE then
+                for _, u in pairs(idle) do
+                    if u.status and u.status.labors
+                        and u.status.labors[labor] ~= true then
+                        u.status.labors[labor] = true
+                        matched = matched + 1
+                        break
+                    end
+                end
+            end
+        end
+    end
+
+    if haul_fixed > 0 or matched > 0 then
+        dfhack.println(('[df-ai] idle check: %d dwarf(s) without a job — '
+            .. 'hauling enabled for %d, work labors matched to open jobs: %d')
+            :format(count, haul_fixed, matched))
+    end
+
+    -- 4) many idlers and nothing open at all: nudge the order engine once
+    --    per in-game day (the normal stocks cadence is 600 ticks; this
+    --    only matters when the queue actually ran dry)
+    if count >= 4 and haul_fixed == 0 and matched == 0 then
+        local day = nil
+        pcall(function()
+            day = df.global.cur_year * 1000000
+                + math.floor(df.global.cur_year_tick / 1200)
+        end)
+        if day and self._idle_nudged_day ~= day then
+            self._idle_nudged_day = day
+            local stocks = self.ai and self.ai.stocks
+            if stocks and stocks.update then
+                dfhack.println('[df-ai] ' .. count
+                    .. ' idle dwarves and no open jobs — running an early stocks audit')
+                pcall(function() stocks:update() end)
+            end
+        end
     end
 end
 

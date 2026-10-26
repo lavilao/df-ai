@@ -10,6 +10,14 @@
 --             (Sleep = most boring = highest score)
 -- plus: anti-repeat (never re-follow the last 3 units), real follow
 -- (plotinfo.follow_unit write, not just a viewport pan).
+--
+-- r3.11 MANUAL CAMERA YIELD: the follow write alone tracks the unit via
+-- the game; re-panning the viewport every update (r3.10 behavior) kept
+-- yanking the view back and the player could not pan or change z-level
+-- while df-ai ran. Now the viewport is only touched when a NEW target is
+-- picked; if the player pans away (the game clears follow_unit while the
+-- unit is still alive) following suspends for a cooldown instead of
+-- fighting the player.
 
 local Camera = {}
 Camera.__index = Camera
@@ -18,6 +26,10 @@ Camera.__index = Camera
 -- 50 ticks, so rotate every 40th call
 local ROTATE_CALLS = 40
 local ANTI_REPEAT = 3
+-- manual-control cooldown after the player pans away: 48 update calls
+-- at the 50-tick cadence = ~2400 ticks before autonomous following
+-- resumes (user-facing hint says "a couple of minutes")
+local MANUAL_HOLD_CALLS = 48
 
 function Camera.new(ai)
     local o = {
@@ -26,6 +38,8 @@ function Camera.new(ai)
         follow_prev = {},
         enabled = true,
         tick = 0,
+        hold_calls = 0,
+        released_logged = false,
     }
     setmetatable(o, Camera)
     return o
@@ -202,25 +216,52 @@ function Camera:update()
     self.tick = self.tick + 1
 
     -- an external follow (user, military screen) takes precedence, like
-    -- the C++ "followed unit changed externally" handling
-    local ext = -1
-    pcall(function() ext = df.global.plotinfo.follow_unit end)
-    if ext ~= nil and ext >= 0 and ext ~= self.following then
-        self.following = ext
-    end
+    -- the C++ "followed unit changed externally" handling. tonumber()
+    -- guards against odd mocks / transient game states.
+    local ext = nil
+    pcall(function() ext = tonumber(df.global.plotinfo.follow_unit) end)
 
-    if self.tick % ROTATE_CALLS == 0
-        or self.following == nil or self.following < 0 then
-        self:pick_target()
+    -- manual-control cooldown: while held we only shadow external follows
+    if self.hold_calls > 0 then
+        self.hold_calls = self.hold_calls - 1
+        if ext and ext >= 0 and ext ~= self.following then
+            self.following = ext
+        end
+        if self.hold_calls == 0 then
+            self.released_logged = false
+            -- cooldown over: resume autonomous following (if the player
+            -- pans again the very same yield dance restarts — self-
+            -- correcting instead of never coming back)
+            self:pick_target()
+        end
         return
     end
 
-    local unit = df.unit.find(self.following)
-    if not unit or not dfhack.units.isAlive(unit) then
-        self:pick_target()
-        return
+    local rotating = self.tick % ROTATE_CALLS == 0
+        or self.following == nil or self.following < 0
+
+    if not rotating then
+        local unit = df.unit.find(self.following)
+        if not unit or not dfhack.units.isAlive(unit) then
+            rotating = true -- target vanished: pick the next one now
+        elseif ext and ext < 0 then
+            -- we set follow_unit and the game cleared it while the unit
+            -- lives: the player moved the camera. Yield instead of yanking
+            -- the view back (the r3.10 per-update reveal did exactly that).
+            self.hold_calls = MANUAL_HOLD_CALLS
+            if not self.released_logged then
+                self.released_logged = true
+                dfhack.println('[df-ai] camera released for manual control '
+                    .. '(following resumes shortly; `df-ai enable camera off` '
+                    .. 'disables it entirely)')
+            end
+            return
+        else
+            return -- tracking silently; the game keeps the view centered
+        end
     end
-    self:reveal(unit)
+
+    self:pick_target()
 end
 
 function Camera:follow_unit(unit_id)
@@ -237,7 +278,12 @@ function Camera:follow_unit(unit_id)
 end
 
 function Camera:status()
-    return '  Following: ' .. (self.following >= 0 and tostring(self.following) or 'none')
+    local line = '  Following: '
+        .. (self.following >= 0 and tostring(self.following) or 'none')
+    if self.hold_calls > 0 then
+        line = line .. '  (yielded for manual camera control)'
+    end
+    return line
 end
 
 return Camera

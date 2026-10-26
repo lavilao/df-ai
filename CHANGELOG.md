@@ -1,3 +1,33 @@
+# r3.11
+
+- Fixed the AI camera hijacking the player's viewport: the view was
+  re-panned to the followed unit every 50 ticks, making it impossible to
+  pan or change z-levels while df-ai ran. Picking a NEW target now pans
+  once; while tracking, the game's follow does the work.
+- The camera now yields for ~2400 ticks whenever the player moves the
+  camera manually (detected via the game clearing follow_unit), then
+  resumes autonomous following. `df-ai enable camera off` still disables
+  it entirely.
+- New idler sweep (`Population:check_idle`, ~every 325 ticks): enables
+  every hauling labor on dwarves with no job, matches idle dwarves to
+  open unassigned jobs by labor (classic autolabor gap), and when 4+
+  dwarves idle with an empty job queue pokes the stocks engine for an
+  early order audit (once per in-game day).
+- LABOR_BASIC now includes ALL hauling labors — it previously had only
+  HAUL_STONE, so dwarves stood next to wood/food/furniture with nothing
+  to haul it with.
+- Trade automation, finally real: the r3.10 claim that the v50+ trade UI
+  was "not mapped in df-structures" was wrong — the whole screen lives
+  in `df.global.game.main_interface.trade` (verified in the 53.16
+  structures; same fields the community 'caravan' overlay uses). While a
+  caravan sits at the depot and the trade screen is open, df-ai marks
+  every fort good except artifacts, bin contents (their bin carries
+  them) and the keep-list (seeds/plants/food/drink/thread/cloth).
+  Optional auto-confirm keypress behind `df-ai enable trade_confirm`
+  (default off) until verified on the user's build.
+- New tests: test/test_qol_r311.lua (23 checks) + camera contract
+  rewritten in test/unit_fixes.lua.
+
 # Future
 
 - Added announcements to the lockstep movie recording log.
