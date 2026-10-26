@@ -103,14 +103,16 @@ Phase 0  Core Infrastructure
 | Camera follow history | `camera.lua` |
 | Persist/unpersist | `plan.lua` |
 
-## Status — r3.11 (updated pending list)
+## Status — r3.12 (updated pending list)
 
 Parity with the C++ build is now complete for: blueprints + priorities,
 construction, manager orders (stocks), farms, military drafting + kill
 orders, pets, nobles, justice detection, ghosts, persistence (NEW — did
-not exist in C++), camera (now with manual-control yield the C++ build
-never had), the idler sweep, and trade goods marking (via the mapped
-v50+ trade UI).
+not exist in C++, and WORKING as of r3.12: save+reload restores the plan
+instead of re-planning), camera (manual-control yield), the idler sweep,
+trade goods marking (via the mapped v50+ trade UI), and the z-connection
+dig pipeline (furniture stairs + per-tile corridor stairwells + stall
+reset so an unreachable room can never freeze the whole plan again).
 
 ### Pending
 
@@ -126,4 +128,5 @@ v50+ trade UI).
 | Cistern deep-channelling | partial | port plan_cistern.cpp channel sequencing |
 | Soldier tool confiscation | missing | stocks_equipment follow-up |
 | Caged-prisoner pit pipeline | missing | population follow-up |
-| autolabor mismatch (rare "unit doing Fish") | low priority | reproduce, then report upstream |
+| autolabor mismatch (rare "unit doing Fish") | low priority | vanilla work-details assign jobs independently of unit labors; cosmetic warning, dwarves do work — reproduce, then report upstream |
+| Reachability probe before designating | future hardening | currently the stall reset (r3.12) recovers after ~6000 ticks; a path-reachability check at digroom() time would avoid the dead window entirely |

@@ -135,7 +135,6 @@ function AI:load_modules()
         camera = 'df-ai/camera',
         trade = 'df-ai/trade',
         embark = 'df-ai/embark',
-        persist = 'df-ai/persist',
     }
     for key, path in pairs(mods) do
         local ok, mod = pcall(dfhack.run_script_with_env, nil, path, {module=true})
@@ -144,6 +143,18 @@ function AI:load_modules()
         else
             debug_log('failed to load module ' .. path .. ': ' .. tostring(mod))
         end
+    end
+    -- r3.12: persist is a UTILITY module (plain table of functions, no
+    -- .new constructor) — the class loader above always rejected it, the
+    -- slot stayed nil, and because AI:persist() used to be a METHOD on
+    -- the class, `self.persist` fell through __index to that method and
+    -- crashed with "attempt to index a function value (field 'persist')"
+    -- on every save/unload. Loaded explicitly as a plain module now.
+    local okp, pers = pcall(dfhack.run_script_with_env, nil, 'df-ai/persist', {module=true})
+    if okp and type(pers) == 'table' and pers.save and pers.load then
+        self.persist = pers
+    else
+        debug_log('failed to load module df-ai/persist: ' .. tostring(pers))
     end
     -- Load rooms module (not a class, just utility)
     local ok, rooms = pcall(dfhack.run_script_with_env, nil, 'df-ai/rooms', {module=true})
@@ -171,29 +182,27 @@ function AI:on_state_change(sc)
         -- build tore ALL state down the moment the save went away —
         -- without this, Lua globals from the previous world (population
         -- caches, plan rooms, last_report_id) leak into the next world
-        -- and the AI acts on ghosts. If the plugin stays enabled we
-        -- either re-arm the auto-embark watcher (random_embark: the old
-        -- log shows it immediately "choosing \"Continue Game\"" after a
-        -- world unload) or genuinely disable ourselves when there is
-        -- nothing for us to do at the menus.
+        -- and the AI acts on ghosts.
         debug_log('world unloaded, disabling self')
         self:shutdown()
         self:clear()
         the_ai = nil
-        if ai_enabled and self.config and self.config.random_embark then
-            -- fresh instance for the next world, embark watcher re-armed
-            -- by shutdown() above
-            the_ai = AI:new()
-            the_ai:init()
-        elseif ai_enabled then
-            ai_enabled = false
-            debug_log('df-ai disabled (random_embark off — nothing to do '
-                .. 'without a world)')
-        end
+        -- r3.12: ALWAYS disable on world unload. The old behavior
+        -- re-created the AI and re-armed the auto-embark watcher when
+        -- random_embark was on, which drove the title screen into
+        -- "Continue Playing" and reloaded the fort the user had JUST
+        -- quit ("it didn't disable itself when I save and went back to
+        -- the main menu, causing the script to load the world again").
+        -- Auto-embark is a one-shot helper for `enable df-ai` at the
+        -- title screen; a world unload means the user chose to leave —
+        -- we stay out of the menus until they re-enable.
+        ai_enabled = false
+        debug_log('df-ai disabled — run "enable df-ai" to start it again')
     end
 end
 
 function AI:startup()
+    if not ai_enabled then return end
     debug_log('AI starting up')
     -- only (re)load modules if missing — startup can run after init()
     -- already created them, and re-loading would discard module state
@@ -296,12 +305,12 @@ function AI:shutdown()
     repeatutil.cancel(GLOBAL_KEY .. '-camera')
     repeatutil.cancel(GLOBAL_KEY .. '-tag')
     repeatutil.cancel(GLOBAL_KEY .. '-embark')
+    repeatutil.cancel(GLOBAL_KEY .. '-heartbeat')
     self:clear()
-    -- if still enabled, re-arm the auto-embark watcher so the
-    -- abandon -> new fortress cycle keeps working
-    if ai_enabled and self.config and self.config.random_embark then
-        self:arm_embark_watch()
-    end
+    -- r3.12: NO embark-watcher re-arm here. shutdown() runs on both
+    -- SC_MAP_UNLOADED and SC_WORLD_UNLOADED; re-arming drove the title
+    -- screen behind the user's back and reloaded saves they had just
+    -- quit. The watcher is armed ONLY by `enable df-ai` (one-shot).
 end
 
 -- Auto-embark watcher: polls the pre-fortress screens while no map is
@@ -354,7 +363,13 @@ end
 -- C++ persists on SC_BEGIN_UNLOAD, on the save/abandon option screen
 -- and while ui->main.autosave_request is set. Called from the
 -- state-change hook and the heartbeat below.
-function AI:persist()
+-- r3.12: renamed from AI:persist() — that name collided with the
+-- MODULE SLOT self.persist (the persist module table), so with the
+-- module missing the call `self.persist:save(...)` indexed the method
+-- itself: "attempt to index a function value (field 'persist')" and NO
+-- save ever reached the disk (which is why every reload re-planned the
+-- fortress from scratch).
+function AI:persist_checkpoint()
     if self.persist and self.plan and self.plan.setup_done then
         self.persist:save(self.plan, self.population, function(msg)
             debug_log(msg)
@@ -616,7 +631,7 @@ function AI:register_repeating_tasks()
             local ok_a, areq = pcall(function()
                 return df.global.plotinfo.main.autosave_request end)
             if ok_a and areq then
-                safe(function() self:persist() end, 'autosave persist')
+                safe(function() self:persist_checkpoint() end, 'autosave persist')
             end
         end, 'autosave check')
         safe(function() self:heartbeat() end, 'heartbeat')
@@ -1054,7 +1069,7 @@ local function print_status()
 end
 
 local function print_version()
-    print('df-ai Lua rewrite for DF 53.16 (DFHack 53.16-r3) — build r3.11')
+    print('df-ai Lua rewrite for DF 53.16 (DFHack 53.16-r3) — build r3.12')
     print('Based on BenLubar/df-ai')
 end
 
@@ -1241,7 +1256,7 @@ dfhack.onStateChange[GLOBAL_KEY] = function(sc)
         if the_ai then
             -- r3.10 (C++ ai.cpp SC_BEGIN_UNLOAD): persist the plan BEFORE
             -- the teardown, so save+reload restores instead of re-planning
-            safe(function() the_ai:persist() end, 'map-unload persist')
+            safe(function() the_ai:persist_checkpoint() end, 'map-unload persist')
             safe(function() the_ai:shutdown() end, 'shutdown')
         end
     elseif sc == SC_VIEWSCREEN_CHANGED then
@@ -1275,14 +1290,14 @@ dfhack.onStateChange[GLOBAL_KEY] = function(sc)
             local ok_v, view = pcall(function()
                 return dfhack.gui.getCurViewscreen(true) end)
             if ok_v and view and the_ai and view._type == df.viewscreen_optionst then
-                the_ai:persist()
+                the_ai:persist_checkpoint()
             end
         end, 'option-screen persist')
     elseif sc == SC_WORLD_UNLOADED then
         -- C++ parity: "world unloaded, disabling self" (ai.cpp). All
         -- module state is dead the moment the save goes away.
         if the_ai then
-            safe(function() the_ai:persist() end, 'world-unload persist')
+            safe(function() the_ai:persist_checkpoint() end, 'world-unload persist')
             safe(function() the_ai:on_state_change(sc) end, 'world unload')
         end
     end

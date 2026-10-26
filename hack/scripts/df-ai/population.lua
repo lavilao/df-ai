@@ -700,9 +700,14 @@ function Population:draft_unit(unit, squad_size, want_ranged)
 
     local is_ranged = false
     pcall(function() is_ranged = squad.alias == 'Heavy ranged' end)
-    if created or not squad.uniform_ready then
+    -- r3.12: the squad uniform_ready flag does not exist in the 53.16
+    -- structures (reading OR writing it throws "Cannot read/write field
+    -- ...: not found", which aborted the whole population update). The
+    -- 0.47 flag is replaced by a Lua-side latch keyed on squad id.
+    self.uniform_ready_ids = self.uniform_ready_ids or {}
+    if created or not self.uniform_ready_ids[squad.id] then
         apply_squad_uniform(squad, is_ranged or want_ranged)
-        squad.uniform_ready = true
+        self.uniform_ready_ids[squad.id] = true
     end
 
     -- leader slot empty? the first draftee becomes the captain

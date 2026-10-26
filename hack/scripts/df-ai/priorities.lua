@@ -333,10 +333,16 @@ local function act(plan, rule)
         for _, r in ipairs(plan.rooms) do
             if r.status == 'plan' and not not_matches(rule, r)
                 and M.room_matches(rule.match or {}, r) then
-                rule.working = true
-                action(plan, r)
-                if not rule.keep_going then return true end
-                if not all_count_gates(plan, rule) then return false end
+                -- r3.12: only stop the rule when the action actually
+                -- took the room (wantdig refuses rooms in give-up
+                -- backoff) — otherwise one unreachable room wedges the
+                -- whole rule and every room behind it
+                local took = action(plan, r)
+                rule.working = took and true or rule.working
+                if took then
+                    if not rule.keep_going then return true end
+                    if not all_count_gates(plan, rule) then return false end
+                end
             end
         end
         return false
@@ -385,10 +391,15 @@ function M.checkidle(plan)
         return false
     end
 
-    -- don't run priorities while a queue-0 room is being dug
+    -- don't run priorities while a queue-0 room is being dug. C++
+    -- parity (plan_task.cpp): CORRIDOR rooms are exempt — the access
+    -- chains are corridors, and requiring them to finish first froze
+    -- the entire rule engine whenever a corridor dig stalled (r3.12:
+    -- the "dwarves never build anything" deadlock).
     for _, t in ipairs(plan.tasks_generic) do
         if (t.type == 'want_dig' or t.type == 'dig_room_immediate')
-            and t.room and (t.room.queue or 0) == 0 then
+            and t.room and (t.room.queue or 0) == 0
+            and t.room.type ~= 'corridor' then
             return false
         end
     end

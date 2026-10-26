@@ -1,3 +1,66 @@
+# r3.12
+
+The "dwarves never build anything" release. The user fort had 455 rooms
+planned, 49 dig designations sitting on the map, 6 dig tasks stuck, and
+miners idling — with exactly 1 room finished. Four independent blockers
+were found and removed:
+
+- THE build blocker: `room:dig_mode()` lost the C++ furniture lookup.
+  The C++ returns a layout item's explicit dig (DownStair grid of the
+  start room, stair connectors between z-levels) BEFORE any generic
+  mode; the port dropped that lookup entirely, and its furniture loop
+  only carved stairs out of WALL tiles. Result: the DownStair furniture
+  on surface FLOOR tiles was never designated, the entrance never
+  connected to the levels below, and EVERY underground designation sat
+  unreachable while miners stood idle. dig_mode now mirrors C++
+  (furniture first, then channeled, then per-tile corridor stairs:
+  UpStair bottom / UpDownStair middle / DownStair top).
+- `room:dig()` now matches C++ AI::dig_tile/room::dig verbatim:
+  exact-WALL main-loop condition (DownStair/Channel on any non-open
+  non-STAIR_DOWN tile, walls with any mode), construction-material skip,
+  skip tiles with an active Digging/Gathering job ("Inappropriate dig
+  square" spam), `dsgn_check_cooldown` reset so the game notices new
+  designations instantly, and `dig_marked` parity.
+- `room:is_dug()` used the broad basic-Wall shape set: a single TREE
+  inside a surface room's bounds kept it in 'dig' FOREVER (nrdig slots
+  eaten, nothing else ever designated). Now only the EXACT WALL shape
+  blocks, and furniture tiles are checked C++-style (wall => not dug,
+  un-channeled Channel tile => not dug).
+- Deadlock breaker: the priority-rule engine refused to run while a
+  queue-0 dig task existed, so the six stuck digs froze ALL further
+  planning (no start room, no bedrooms, nothing). Two safety nets:
+  (1) corridor rooms no longer block the engine (C++ parity), and
+  (2) a dig task that mines ZERO tiles over 7 passes (~6000 ticks)
+  gives up — designations are cleared, the room returns to the plan
+  pool and retries after a 10-day cooldown. Rules now skip rooms in
+  give-up backoff instead of wedging on the first unreachable one.
+- Persistence actually works now: `AI:persist()` (the method) collided
+  with the `self.persist` MODULE SLOT — the utility module has no
+  `.new` constructor so the class loader always rejected it, and
+  `self.persist` then fell through `__index` to the method itself,
+  crashing with "attempt to index a function value (field 'persist')"
+  on every save/unload. That is why the "failed to load module
+  df-ai/persist: table: 0x..." spam appeared and why no plan ever got
+  saved (every reload re-planned the fortress from scratch on top of
+  the existing one). The method is now `AI:persist_checkpoint()` and
+  the module loads as a plain utility.
+- Save & quit no longer drags you back in: on SC_WORLD_UNLOADED the AI
+  now ALWAYS disables itself. The old code re-created the AI and
+  re-armed the auto-embark watcher when random_embark was on, which
+  drove the title screen into "Continue Playing" and reloaded the save
+  the user had JUST quit (plus double-driving load/unload churn).
+  Auto-embark is now a one-shot helper for `enable df-ai` at the title
+  screen; shutdown() also cancels the heartbeat repeat.
+- population.lua:705 crash fixed: `squad.uniform_ready` does not exist
+  in the 53.16 structures ("Cannot write field ... not found" aborted
+  every population update). Replaced by a Lua-side latch keyed on
+  squad id.
+- Tests: r3.12 block in test/unit_fixes.lua (furniture stairs down into
+  floors, exact-wall is_dug, full stall-reset cycle through the real
+  queue processor, corridor guard exemption, persist checkpoint, no
+  uniform_ready); world-unload contract updated to always-disable.
+  All 6 suites green (190 unit checks).
+
 # r3.11
 
 - Fixed the AI camera hijacking the player's viewport: the view was

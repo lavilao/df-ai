@@ -1056,7 +1056,7 @@ do
     block.tiletype[10][11] = SHAPE.WALL
     check(r:dig_remaining() == 1, 'dig_remaining counts a wall')
 
-    print('--- r3.6: multi-z corridors dig UpDownStair ---')
+    print('--- r3.6: multi-z corridors dig stairs (r3.12: per-tile) ---')
     local c = rooms_mod.room.new('corridor',
         { x = 5, y = 5, z = 98 }, { x = 5, y = 5, z = 100 },
         { corridor_type = 'corridor' })
@@ -1064,15 +1064,23 @@ do
     for z = 98, 100 do
         blocks[z].tiletype[5][5] = SHAPE.WALL
     end
-    local d2 = c:dig_mode()
-    check(d2 == TDD.UpDownStair, 'multi-z corridor dig_mode is UpDownStair')
+    -- r3.12: C++ dig_mode is per-tile: bottom=UpStair, middle=UpDownStair,
+    -- top=DownStair (the old port made every tile UpDownStair, which
+    -- cannot chain into the level ABOVE the corridor top)
+    check(c:dig_mode({ x = 5, y = 5, z = 99 }) == TDD.UpDownStair,
+        'mid stairwell tile dig_mode is UpDownStair')
+    check(c:dig_mode({ x = 5, y = 5, z = 98 }) == TDD.UpStair,
+        'bottom stairwell tile dig_mode is UpStair')
+    check(c:dig_mode({ x = 5, y = 5, z = 100 }) == TDD.DownStair,
+        'top stairwell tile dig_mode is DownStair')
     local des2 = c:dig()
     check(des2 == 3, 'stairwell tiles designated (got ' .. tostring(des2) .. ')')
     check(blocks[99].designation[5][5].dig == TDD.UpDownStair,
-        'stairwell got UpDownStair designation on every level')
-    check(blocks[98].designation[5][5].dig == TDD.UpDownStair
-        and blocks[100].designation[5][5].dig == TDD.UpDownStair,
-        'top and bottom stairwell tiles designated too')
+        'middle stairwell got UpDownStair designation')
+    check(blocks[98].designation[5][5].dig == TDD.UpStair,
+        'bottom stairwell got UpStair designation')
+    check(blocks[100].designation[5][5].dig == TDD.DownStair,
+        'top stairwell got DownStair designation')
     -- single-z corridor still Default
     local c1 = rooms_mod.room.new('corridor',
         { x = 5, y = 5, z = 99 }, { x = 5, y = 5, z = 99 },
@@ -1368,7 +1376,7 @@ do
     check(opt_errs == 1, 'each distinct viewscreen gets its own single log')
 
     -- --------------------------------------------------------
-    -- 9e. world unloaded -> teardown + self-disable / re-arm
+    -- 9e. world unloaded -> teardown + ALWAYS self-disable (r3.12)
     -- --------------------------------------------------------
     _G.ai_enabled = true
     _G.the_ai = ai2
@@ -1377,16 +1385,232 @@ do
     check(_G.the_ai == nil and _G.ai_enabled == false,
         'world unload with random_embark OFF: AI torn down AND self-disabled')
 
+    -- r3.12: the old behavior re-created the AI and re-armed the
+    -- auto-embark watcher when random_embark was on — that drove the
+    -- title screen into "Continue Playing" and reloaded the save the
+    -- user had JUST quit. Now a world unload ALWAYS disables: the
+    -- auto-embark watcher is a one-shot helper for `enable df-ai`.
     _G.ai_enabled = true
     _G.the_ai = ai3
     ai3.config.random_embark = true
     ai3:on_state_change(_G.SC_WORLD_UNLOADED)
-    check(_G.the_ai ~= nil and _G.the_ai ~= ai3,
-        'world unload with random_embark ON: fresh AI instance (old-build "Continue Game" parity)')
-    check(_G.ai_enabled == true,
-        'plugin stays enabled for the auto-embark flow')
+    check(_G.the_ai == nil and _G.ai_enabled == false,
+        'world unload with random_embark ON: still self-disables (no auto reload)')
     _G.ai_enabled = false
     _G.the_ai = nil
+end
+
+-- ============================================================
+-- 16. r3.12: the "dwarves never build anything" wave
+--     (user fort: 455 planned rooms, 49 unreachable dig designations,
+--     6 stuck dig tasks, idle miners, 1 room finished in 3 game years)
+-- ============================================================
+print('--- r3.12: dig_mode furniture lookup (stairs DOWN into floors) ---')
+do
+    local ok_rm, rooms_mod = pcall(dfhack_mock.run_script_with_env,
+        nil, 'df-ai/rooms', { module = true })
+    check(ok_rm, 'rooms module loads for r3.12 checks: ' .. tostring(rooms_mod))
+    if ok_rm then
+        -- surface z=150: everything FLOOR (open ground), the start room
+        -- template is a grid of DownStair furniture — dig_mode must
+        -- return the furniture's dig and dig() must designate it on a
+        -- FLOOR tile (the r3.6-r3.11 code only dug stairs out of WALLS,
+        -- so the fort never connected to the levels below and every
+        -- underground designation sat unreachable while miners idled)
+        local SHAPE = { FLOOR = 1, WALL = 2, OPEN = 10 }
+        local TDD = df_mock.tile_dig_designation
+        local blocks = {}
+        local function make_block(z)
+            local b = { flags = { designated = false },
+                tiletype = {}, designation = {} }
+            for x = 0, 15 do
+                b.tiletype[x] = {}
+                b.designation[x] = {}
+                for y = 0, 15 do
+                    b.tiletype[x][y] = SHAPE.FLOOR
+                    b.designation[x][y] = { dig = TDD.No }
+                end
+            end
+            blocks[z] = b
+            return b
+        end
+        for z = 96, 104 do make_block(z) end
+        local block = blocks[100]
+        local old_getTileBlock = dfhack_mock.maps.getTileBlock
+        dfhack_mock.maps.getTileBlock = function(x, y, z)
+            return blocks[z]
+        end
+
+        local start = rooms_mod.room.new('outpost',
+            { x = 10, y = 10, z = 100 }, { x = 12, y = 12, z = 100 }, {})
+        start.layout = { rooms_mod.furniture.new('shaft',
+            { x = 11, y = 11, z = 100 }, { dig = TDD.DownStair }) }
+        check(start:dig_mode({ x = 11, y = 11, z = 100 }) == TDD.DownStair,
+            'dig_mode returns the furniture dig at its tile')
+        check(start:dig_mode({ x = 10, y = 10, z = 100 }) == TDD.Default,
+            'dig_mode returns Default away from furniture')
+        local ndes = start:dig()
+        check(ndes == 1, 'start room designates exactly the DownStair (got '
+            .. tostring(ndes) .. ')')
+        check(block.designation[11][11].dig == TDD.DownStair,
+            'DownStair designated on a FLOOR tile (THE fix: z-connection)')
+        check(block.designation[10][10].dig == TDD.No,
+            'plain surface floor stays undesignated')
+
+        print('--- r3.12: is_dug only EXACT WALL blocks ---')
+        -- a TREE (basic-wall in the r3.6 set) inside a room must not
+        -- keep it in 'dig' forever (surface rooms froze on trees)
+        block.designation[11][11].dig = TDD.No
+        local r_tree = rooms_mod.room.new('outpost',
+            { x = 10, y = 10, z = 100 }, { x = 12, y = 12, z = 100 }, {})
+        -- tiletype mock: value == shape; use TREE = 8 (df_mock.tiletype_shape.TREE)
+        block.tiletype[12][12] = 8 -- TREE
+        local dug_tree, why_tree = r_tree:is_dug()
+        check(dug_tree == true,
+            'room with a TREE inside IS dug (exact-wall semantics), why=' ..
+            tostring(why_tree))
+        block.tiletype[12][12] = SHAPE.WALL
+        local dug_wall = r_tree:is_dug()
+        check(dug_wall == false, 'room with an EXACT WALL is not dug')
+        block.tiletype[12][12] = SHAPE.FLOOR
+
+        print('--- r3.12: stuck dig stall reset ---')
+        df_mock.global.cur_year = 3
+        df_mock.global.cur_year_tick = 500000
+        local ok_pl, Plan = pcall(dfhack_mock.run_script_with_env,
+            nil, 'df-ai/plan', { module = true })
+        check(ok_pl, 'plan module loads for r3.12 checks: ' .. tostring(Plan))
+        if ok_pl then
+            -- solid rock room: 9 WALL tiles, never mined
+            for x = 0, 15 do
+                for y = 0, 15 do
+                    block.tiletype[x][y] = SHAPE.WALL
+                    block.designation[x][y].dig = TDD.No
+                end
+            end
+            local pl = Plan.new({})
+            local stuck = rooms_mod.room.new('stockpile',
+                { x = 10, y = 10, z = 100 }, { x = 12, y = 12, z = 100 }, {})
+            stuck.accesspath = {}
+            pl:digroom(stuck)
+            check(stuck.status == 'dig', 'digroom set status to dig')
+            check(#pl.tasks_generic == 1, 'dig task queued')
+            -- seven stalled passes: pass 1 opens the tracking window
+            -- (fresh designation), the next 6 see zero tiles mined.
+            -- Driven through the REAL queue processor: every second call
+            -- hits the 1000-tick drain-wait, so 15 calls at 1001-tick
+            -- spacing deliver the 7 passes (1 + 6 stalls) that reach the
+            -- give-up threshold.
+            for i = 1, 15 do
+                df_mock.global.cur_year_tick = 500000 + i * 1001
+                pl:process_tasks_generic(1)
+            end
+            check(#pl.tasks_generic == 0, 'stuck dig task deleted after 7 stalled passes')
+            check(stuck.status == 'plan', 'stuck room returned to the plan pool')
+            check(stuck._dig_gave_up ~= nil, 'give-up timestamp recorded')
+            check(block.designation[10][10].dig == TDD.No,
+                'stale designations cleared on give-up')
+            -- backoff: wantdig refuses the room right after the give-up
+            local took = pl:wantdig(stuck)
+            check(took == false, 'wantdig refuses a room in give-up backoff')
+            -- after the backoff window the room is wanted again
+            df_mock.global.cur_year_tick = stuck._dig_gave_up + 12001
+            check(pl:wantdig(stuck) == true,
+                'wantdig accepts the room after the backoff window')
+            df_mock.global.cur_year_tick = 500000
+        end
+
+        print('--- r3.12: checkidle guard corridor exemption ---')
+        if ok_pl then
+            local ok_pri, priorities = pcall(dfhack_mock.run_script_with_env,
+                nil, 'df-ai/priorities', { module = true })
+            check(ok_pri, 'priorities module loads: ' .. tostring(priorities))
+            if ok_pri then
+                for x = 0, 15 do
+                    for y = 0, 15 do
+                        block.tiletype[x][y] = SHAPE.FLOOR
+                    end
+                end
+                local pl2 = Plan.new({})
+                local corr = rooms_mod.room.new('corridor',
+                    { x = 3, y = 3, z = 100 }, { x = 3, y = 3, z = 100 },
+                    { corridor_type = 'corridor' })
+                corr.status = 'dig'
+                corr.accesspath = {}
+                pl2.tasks_generic = { { type = 'dig_room_immediate', room = corr } }
+                local bedroom = rooms_mod.room.new('bedroom',
+                    { x = 6, y = 6, z = 100 }, { x = 6, y = 6, z = 100 }, {})
+                pl2.rooms = { bedroom }
+                pl2.priority_rules = priorities.prepare({
+                    { name = 'dig all', action = 'dig', match = {} },
+                })
+                local acted = priorities.checkidle(pl2)
+                check(acted == true and #pl2.tasks_generic == 2,
+                    'corridor q0 dig does NOT block the rule engine (C++ parity)')
+                local pl3 = Plan.new({})
+                bedroom.status = 'dig'
+                bedroom.queue = 0
+                pl3.tasks_generic = { { type = 'dig_room_immediate', room = bedroom } }
+                pl3.rooms = { rooms_mod.room.new('bedroom',
+                    { x = 8, y = 8, z = 100 }, { x = 8, y = 8, z = 100 }, {}) }
+                pl3.priority_rules = priorities.prepare({
+                    { name = 'dig all', action = 'dig', match = {} },
+                })
+                local acted3 = priorities.checkidle(pl3)
+                check(acted3 == false and #pl3.tasks_generic == 1,
+                    'non-corridor q0 dig still focuses the engine (guard kept)')
+            end
+        end
+
+        print('--- r3.12: persist module slot + checkpoint rename ---')
+        local ok_ai, AI = pcall(dfhack_mock.run_script_with_env,
+            nil, 'df-ai', { module = true })
+        check(ok_ai, 'df-ai module loads: ' .. tostring(AI))
+        if ok_ai then
+            check(rawget(AI, 'persist') == nil,
+                'AI class no longer defines a persist() method (slot collision gone)')
+            check(type(AI.persist_checkpoint) == 'function',
+                'AI:persist_checkpoint exists')
+            local ok_pers, persist_mod = pcall(dfhack_mock.run_script_with_env,
+                nil, 'df-ai/persist', { module = true })
+            check(ok_pers and type(persist_mod) == 'table'
+                and type(persist_mod.save) == 'function'
+                and type(persist_mod.load) == 'function' and not persist_mod.new,
+                'persist module is a utility table (save/load, no .new)')
+            local save_calls = 0
+            local ai_obj = setmetatable({
+                persist = { save = function() save_calls = save_calls + 1 end },
+                plan = { setup_done = true },
+                population = {},
+            }, { __index = AI })
+            ai_obj:persist_checkpoint()
+            check(save_calls == 1,
+                'persist_checkpoint drives persist:save (persistence works again)')
+            -- without the module: no crash (the r3.10-r3.11 code crashed
+            -- here through __index with "attempt to index a function value")
+            local ai_bare = setmetatable({ persist = nil, plan = nil },
+                { __index = AI })
+            local ok_bare, err_bare = pcall(function() ai_bare:persist_checkpoint() end)
+            check(ok_bare, 'persist_checkpoint survives a missing persist module: '
+                .. tostring(err_bare))
+        end
+
+        print('--- r3.12: squad.uniform_ready gone ---')
+        do
+            local f = io.open('hack/scripts/df-ai/population.lua', 'r')
+            local src = f:read('*a')
+            f:close()
+            check(not src:find('squad%.uniform_ready', 1, false)
+                and not src:find('squad.uniform_ready', 1, true),
+                'population.lua no longer touches squad.uniform_ready')
+            check(src:find('uniform_ready_ids', 1, true) ~= nil,
+                'uniform latch moved to a Lua-side table (uniform_ready_ids)')
+        end
+
+        dfhack_mock.maps.getTileBlock = old_getTileBlock
+        df_mock.global.cur_year = nil
+        df_mock.global.cur_year_tick = nil
+    end
 end
 
 print(failures == 0 and '=== ALL UNIT TESTS PASS ==='

@@ -601,9 +601,18 @@ end
 -- 1 = outdoor, -1 bedroom, -2 dining/barracks/noble, -3 farmplot,
 -- -4 pasture). Adds a want_dig task; the actual dig waits for a free
 -- slot (nrdig < wantdig_max) unless immediate.
+-- r3.12: rooms that just gave up digging (stall reset — designations
+-- unreachable) take a cooldown before they are requested again, so the
+-- priority engine can make progress on the rest of the fortress
+-- instead of spinning on the first unreachable room.
+local DIG_GIVEUP_BACKOFF = 12000 -- 10 game days
 function Plan:wantdig(r, queue)
     if not r or r.status ~= 'plan' then return false end
     if r.queue_dig then return false end
+    if r._dig_gave_up
+        and (self:_tick_now() - r._dig_gave_up) < DIG_GIVEUP_BACKOFF then
+        return false
+    end
     if queue ~= nil then r.queue = queue end
     r.queue_dig = true
     self:add_task(TASK_TYPE.want_dig, r)
@@ -618,6 +627,10 @@ function Plan:digroom(room, immediate)
     if room.status ~= 'plan' then return false end
     room.queue_dig = false
     room.status = 'dig'
+    -- r3.12: fresh stall-tracking window for the dig task
+    room._dig_stall = 0
+    room._dig_last_remaining = nil
+    room._dig_gave_up = nil
     local designated = room:dig()
     self:add_task(immediate and TASK_TYPE.dig_room_immediate
         or TASK_TYPE.dig_room, room)
@@ -808,9 +821,14 @@ function Plan:_run_generic_task(t)
             -- Dig accesspath corridors first (accesspath holds ROOM
             -- REFERENCES since r3.7 — the blueprint engine resolves the
             -- parent chain; the old raw-index lookup never found them)
+            -- r3.12: parents in give-up backoff are skipped (an
+            -- unreachable parent must not flap plan->dig every pass)
             if t.room.accesspath and #t.room.accesspath > 0 then
+                local now = self:_tick_now()
                 for _, ap_room in ipairs(t.room.accesspath) do
-                    if ap_room and ap_room.status == 'plan' then
+                    if ap_room and ap_room.status == 'plan'
+                        and not (ap_room._dig_gave_up
+                            and (now - ap_room._dig_gave_up) < DIG_GIVEUP_BACKOFF) then
                         self:digroom(ap_room)
                     end
                 end
@@ -822,6 +840,8 @@ function Plan:_run_generic_task(t)
             local dug, why = t.room:is_dug()
             if dug then
                 t.room.status = 'dug'
+                t.room._dig_stall = nil
+                t.room._dig_last_remaining = nil
                 self:_log('room DUG: ' .. describe_room(t.room))
                 self:construct_room(t.room)
                 del = true
@@ -834,12 +854,41 @@ function Plan:_run_generic_task(t)
                             or ''))
                 end
                 local remaining = t.room:dig_remaining()
-                reason = why or ('still ' .. remaining .. ' tiles of rock')
-                -- If nothing is designated and nothing remains but is_dug
-                -- said false, something is off: log it loudly ONCE.
-                if designated == 0 and remaining == 0 then
-                    task_log_once(self, t, 'no diggable tiles and no walls left — '
-                        .. 'waiting for miners (reason: ' .. tostring(why) .. ')')
+                -- r3.12: stall detection. A room whose designations sit
+                -- UNREACHABLE (entrance stairs not dug yet, aquifer,
+                -- blocked path) keeps its dig task forever, eating a
+                -- wantdig slot AND freezing the priority engine (the
+                -- check_idle guard refuses to run while a queue-0 dig is
+                -- active). If zero tiles were mined over several passes,
+                -- give the room back to the plan pool: clear its
+                -- designations, reset to 'plan', retry after a cooldown.
+                if remaining < (t.room._dig_last_remaining or remaining + 1) then
+                    t.room._dig_stall = 0
+                    t.room._dig_last_remaining = remaining
+                else
+                    t.room._dig_stall = (t.room._dig_stall or 0) + 1
+                    t.room._dig_last_remaining = remaining
+                end
+                if (t.room._dig_stall or 0) >= 6 then
+                    local cleared_n = t.room:clear_dig_designations()
+                    t.room.status = 'plan'
+                    t.room.queue_dig = false
+                    t.room._dig_gave_up = self:_tick_now()
+                    t.room._dig_stall = nil
+                    t.room._dig_last_remaining = nil
+                    del = true
+                    task_log_once(self, t, 'gave up digging (' .. remaining
+                        .. ' tiles stuck, ' .. cleared_n
+                        .. ' designations cleared) — unreachable? room '
+                        .. 'returned to the plan pool (retry after cooldown)')
+                else
+                    reason = why or ('still ' .. remaining .. ' tiles of rock')
+                    -- If nothing is designated and nothing remains but is_dug
+                    -- said false, something is off: log it loudly ONCE.
+                    if designated == 0 and remaining == 0 then
+                        task_log_once(self, t, 'no diggable tiles and no walls left — '
+                            .. 'waiting for miners (reason: ' .. tostring(why) .. ')')
+                    end
                 end
             end
         else
